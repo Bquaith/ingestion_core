@@ -56,6 +56,9 @@ class ContractRegistryClient:
         version = data.get("version") if isinstance(data.get("version"), dict) else {}
 
         schema_json = version.get("schema_json") if isinstance(version.get("schema_json"), dict) else {}
+        if not schema_json and isinstance(data.get("schema"), dict):
+            # Compatibility fallback for simplified contract shape.
+            schema_json = data.get("schema")  # type: ignore[assignment]
         fields_raw = schema_json.get("fields") if isinstance(schema_json.get("fields"), list) else []
 
         fields: list[str] = []
@@ -69,6 +72,8 @@ class ContractRegistryClient:
         keys = schema_json.get("keys") if isinstance(schema_json.get("keys"), dict) else {}
 
         primary_keys = [str(v) for v in (keys.get("primary") or [])]
+        if not primary_keys:
+            primary_keys = [str(v) for v in (schema_json.get("primary_key") or [])]
         business_keys = [str(v) for v in (keys.get("business") or [])]
         hash_keys = [str(v) for v in (keys.get("hash_keys") or [])]
 
