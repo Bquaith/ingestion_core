@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import uuid
+from typing import Any, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -36,6 +38,22 @@ def ensure_audit_tables(engine: Engine) -> None:
             unchanged_count integer NOT NULL DEFAULT 0,
             status text NOT NULL,
             error_text text
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_meta.pipeline_lock (
+            pipeline_id text PRIMARY KEY,
+            run_id uuid NOT NULL,
+            locked_at timestamptz NOT NULL DEFAULT now(),
+            lock_until timestamptz NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_meta.pipeline_checkpoint (
+            pipeline_id text PRIMARY KEY,
+            run_id uuid NOT NULL,
+            checkpoint_json jsonb NOT NULL,
+            updated_at timestamptz NOT NULL DEFAULT now()
         )
         """,
     ]
@@ -87,6 +105,101 @@ def start_run_audit(
         )
 
     return run_id
+
+
+def acquire_pipeline_lock(
+    engine: Engine,
+    pipeline_id: str,
+    run_id: str,
+    ttl_seconds: int = 7200,
+) -> bool:
+    with engine.begin() as conn:
+        lock_row = conn.execute(
+            text(
+                """
+                INSERT INTO ingestion_meta.pipeline_lock (
+                    pipeline_id,
+                    run_id,
+                    locked_at,
+                    lock_until
+                ) VALUES (
+                    :pipeline_id,
+                    :run_id,
+                    now(),
+                    now() + make_interval(secs => :ttl_seconds)
+                )
+                ON CONFLICT (pipeline_id)
+                DO UPDATE SET
+                    run_id = EXCLUDED.run_id,
+                    locked_at = now(),
+                    lock_until = EXCLUDED.lock_until
+                WHERE ingestion_meta.pipeline_lock.lock_until <= now()
+                RETURNING run_id
+                """
+            ),
+            {
+                "pipeline_id": pipeline_id,
+                "run_id": run_id,
+                "ttl_seconds": ttl_seconds,
+            },
+        ).scalar_one_or_none()
+
+    return lock_row is not None
+
+
+def release_pipeline_lock(engine: Engine, pipeline_id: str, run_id: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DELETE FROM ingestion_meta.pipeline_lock
+                WHERE pipeline_id = :pipeline_id
+                  AND run_id = :run_id
+                """
+            ),
+            {
+                "pipeline_id": pipeline_id,
+                "run_id": run_id,
+            },
+        )
+
+
+def persist_pipeline_checkpoint(
+    engine: Engine,
+    pipeline_id: str,
+    run_id: str,
+    checkpoint_payload: Mapping[str, Any],
+) -> None:
+    checkpoint_json = json.dumps(dict(checkpoint_payload), ensure_ascii=True, sort_keys=True)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO ingestion_meta.pipeline_checkpoint (
+                    pipeline_id,
+                    run_id,
+                    checkpoint_json,
+                    updated_at
+                ) VALUES (
+                    :pipeline_id,
+                    :run_id,
+                    :checkpoint_json::jsonb,
+                    now()
+                )
+                ON CONFLICT (pipeline_id)
+                DO UPDATE SET
+                    run_id = EXCLUDED.run_id,
+                    checkpoint_json = EXCLUDED.checkpoint_json,
+                    updated_at = now()
+                """
+            ),
+            {
+                "pipeline_id": pipeline_id,
+                "run_id": run_id,
+                "checkpoint_json": checkpoint_json,
+            },
+        )
 
 
 def finish_run_audit(
