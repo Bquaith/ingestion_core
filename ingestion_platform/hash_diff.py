@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from time import perf_counter
+from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, select
+from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ingestion_platform.hashing import calculate_row_hash
@@ -79,6 +80,20 @@ class HashDiffResult:
     insert_count: int
     update_count: int
     unchanged_count: int
+    processed_batches: int
+    source_read_seconds: float
+    diff_seconds: float
+    write_seconds: float
+    total_seconds: float
+
+    def metrics_dict(self) -> dict[str, float | int]:
+        return {
+            "processed_batches": self.processed_batches,
+            "source_read_seconds": self.source_read_seconds,
+            "diff_seconds": self.diff_seconds,
+            "write_seconds": self.write_seconds,
+            "total_seconds": self.total_seconds,
+        }
 
 
 def build_row_key(row: Mapping[str, Any], key_fields: Sequence[str]) -> tuple[Any, ...]:
@@ -119,6 +134,22 @@ def _validate_source_columns(source_table: Table, fields: Sequence[str]) -> None
         raise ValueError(f"Source table is missing required contract fields: {missing}")
 
 
+def _make_index_name(table_name: str, suffix: str) -> str:
+    return f"idx_{table_name}_{suffix}"[:63]
+
+
+def _ensure_target_indexes(target_engine, target_schema: str, target_table_name: str) -> None:
+    row_hash_index_name = _make_index_name(target_table_name, "row_hash")
+
+    with target_engine.begin() as conn:
+        conn.execute(
+            text(
+                f'CREATE INDEX IF NOT EXISTS "{row_hash_index_name}" '
+                f'ON "{target_schema}"."{target_table_name}" ("row_hash")'
+            )
+        )
+
+
 def _ensure_target_curated_table(
     target_engine,
     target_schema: str,
@@ -155,27 +186,35 @@ def _ensure_target_curated_table(
     if missing_columns:
         raise ValueError(f"Target table is missing required columns: {sorted(missing_columns)}")
 
+    _ensure_target_indexes(target_engine, target_schema, target_table_name)
     return target_table
 
 
-def _read_source_rows(
+def _iter_source_row_batches(
     source_engine,
     source_table: Table,
     fields: Sequence[str],
     key_fields: Sequence[str],
-) -> list[dict[str, Any]]:
+    source_batch_size: int,
+) -> Iterable[tuple[list[dict[str, Any]], float]]:
     query = select(*(source_table.c[field] for field in fields))
     if key_fields:
         query = query.order_by(*(source_table.c[field] for field in key_fields))
 
     with source_engine.connect() as conn:
-        rows = conn.execute(query).mappings().all()
+        result = conn.execution_options(stream_results=True).execute(query).mappings()
 
-    normalized: list[dict[str, Any]] = []
-    for row in rows:
-        normalized.append({field: row[field] for field in fields})
+        while True:
+            fetch_started = perf_counter()
+            rows = result.fetchmany(source_batch_size)
+            fetch_seconds = perf_counter() - fetch_started
+            if not rows:
+                break
 
-    return normalized
+            normalized: list[dict[str, Any]] = []
+            for row in rows:
+                normalized.append({field: row[field] for field in fields})
+            yield normalized, fetch_seconds
 
 
 def _add_row_hashes(rows: Sequence[Mapping[str, Any]], hash_fields: Sequence[str]) -> list[dict[str, Any]]:
@@ -187,17 +226,38 @@ def _add_row_hashes(rows: Sequence[Mapping[str, Any]], hash_fields: Sequence[str
     return result
 
 
-def _read_existing_hashes(
+def _read_existing_hashes_for_keys(
     target_engine,
     target_table: Table,
     key_fields: Sequence[str],
+    key_tuples: Sequence[tuple[Any, ...]],
 ) -> dict[tuple[Any, ...], str]:
-    query = select(*(target_table.c[field] for field in key_fields), target_table.c.row_hash)
+    if not key_tuples:
+        return {}
+
+    unique_keys = list(dict.fromkeys(key_tuples))
 
     with target_engine.connect() as conn:
+        if len(key_fields) == 1:
+            key_field = key_fields[0]
+            key_values = [key[0] for key in unique_keys]
+            query = select(target_table.c[key_field], target_table.c.row_hash).where(
+                target_table.c[key_field].in_(key_values)
+            )
+        else:
+            key_columns = [target_table.c[field] for field in key_fields]
+            query = select(*key_columns, target_table.c.row_hash).where(
+                tuple_(*key_columns).in_(unique_keys)
+            )
+
         rows = conn.execute(query).mappings().all()
 
     return {build_row_key(row, key_fields): row["row_hash"] for row in rows}
+
+
+def _chunk_rows(rows: Sequence[Mapping[str, Any]], chunk_size: int) -> Iterable[list[Mapping[str, Any]]]:
+    for index in range(0, len(rows), chunk_size):
+        yield list(rows[index : index + chunk_size])
 
 
 def _upsert_rows(
@@ -206,23 +266,23 @@ def _upsert_rows(
     rows: Sequence[Mapping[str, Any]],
     key_fields: Sequence[str],
     fields: Sequence[str],
+    upsert_batch_size: int,
 ) -> None:
     if not rows:
         return
 
-    # Keep statement deterministic for testing/debugging
-    sorted_rows = sorted(rows, key=lambda row: build_row_key(row, key_fields))
-
-    insert_stmt = pg_insert(target_table).values(sorted_rows)
     update_fields = [field for field in fields if field not in key_fields] + ["row_hash"]
 
-    upsert_stmt = insert_stmt.on_conflict_do_update(
-        index_elements=list(key_fields),
-        set_={field: insert_stmt.excluded[field] for field in update_fields},
-    )
-
     with target_engine.begin() as conn:
-        conn.execute(upsert_stmt)
+        # Keep statement deterministic for testing/debugging
+        sorted_rows = sorted(rows, key=lambda row: build_row_key(row, key_fields))
+        for rows_chunk in _chunk_rows(sorted_rows, upsert_batch_size):
+            insert_stmt = pg_insert(target_table).values(rows_chunk)
+            upsert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=list(key_fields),
+                set_={field: insert_stmt.excluded[field] for field in update_fields},
+            )
+            conn.execute(upsert_stmt)
 
 
 def run_hash_diff(
@@ -231,9 +291,27 @@ def run_hash_diff(
     target_dsn: str,
     target_table_curated: str,
     contract: ContractDefinition,
+    source_batch_size: int = 1000,
+    upsert_batch_size: int = 1000,
 ) -> HashDiffResult:
+    if source_batch_size <= 0:
+        raise ValueError("source_batch_size must be greater than zero")
+    if upsert_batch_size <= 0:
+        raise ValueError("upsert_batch_size must be greater than zero")
+
     source_engine = create_sqlalchemy_engine(source_dsn)
     target_engine = create_sqlalchemy_engine(target_dsn)
+
+    started_at = perf_counter()
+    read_seconds = 0.0
+    diff_seconds = 0.0
+    write_seconds = 0.0
+
+    read_count = 0
+    insert_count = 0
+    update_count = 0
+    unchanged_count = 0
+    processed_batches = 0
 
     try:
         source_schema, source_name = parse_table_name(source_table)
@@ -251,34 +329,59 @@ def run_hash_diff(
             key_fields=contract.key_fields,
         )
 
-        source_rows = _read_source_rows(
+        for source_batch, fetch_seconds in _iter_source_row_batches(
             source_engine=source_engine,
             source_table=source_table_obj,
             fields=contract.fields,
             key_fields=contract.key_fields,
-        )
-        source_rows_with_hashes = _add_row_hashes(source_rows, contract.effective_hash_fields)
+            source_batch_size=source_batch_size,
+        ):
+            processed_batches += 1
+            read_seconds += fetch_seconds
+            read_count += len(source_batch)
 
-        existing_hashes = _read_existing_hashes(target_engine, target_table_obj, contract.key_fields)
-        inserts, updates, unchanged_count = classify_changes(
-            source_rows=source_rows_with_hashes,
-            existing_hashes=existing_hashes,
-            key_fields=contract.key_fields,
-        )
+            diff_started = perf_counter()
+            source_rows_with_hashes = _add_row_hashes(source_batch, contract.effective_hash_fields)
+            batch_keys = [build_row_key(row, contract.key_fields) for row in source_rows_with_hashes]
+            existing_hashes = _read_existing_hashes_for_keys(
+                target_engine=target_engine,
+                target_table=target_table_obj,
+                key_fields=contract.key_fields,
+                key_tuples=batch_keys,
+            )
+            inserts, updates, unchanged_batch = classify_changes(
+                source_rows=source_rows_with_hashes,
+                existing_hashes=existing_hashes,
+                key_fields=contract.key_fields,
+            )
+            diff_seconds += perf_counter() - diff_started
 
-        _upsert_rows(
-            target_engine=target_engine,
-            target_table=target_table_obj,
-            rows=[*inserts, *updates],
-            key_fields=contract.key_fields,
-            fields=contract.fields,
-        )
+            unchanged_count += unchanged_batch
+            insert_count += len(inserts)
+            update_count += len(updates)
 
+            write_started = perf_counter()
+            _upsert_rows(
+                target_engine=target_engine,
+                target_table=target_table_obj,
+                rows=[*inserts, *updates],
+                key_fields=contract.key_fields,
+                fields=contract.fields,
+                upsert_batch_size=upsert_batch_size,
+            )
+            write_seconds += perf_counter() - write_started
+
+        total_seconds = perf_counter() - started_at
         return HashDiffResult(
-            read_count=len(source_rows_with_hashes),
-            insert_count=len(inserts),
-            update_count=len(updates),
+            read_count=read_count,
+            insert_count=insert_count,
+            update_count=update_count,
             unchanged_count=unchanged_count,
+            processed_batches=processed_batches,
+            source_read_seconds=read_seconds,
+            diff_seconds=diff_seconds,
+            write_seconds=write_seconds,
+            total_seconds=total_seconds,
         )
     finally:
         source_engine.dispose()

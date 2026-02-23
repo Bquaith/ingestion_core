@@ -5,9 +5,11 @@ Airflow-ориентированная платформа инкрементал
 Реализовано:
 - оркестрация через DAG `ingest_contract_hashdiff`
 - интеграция с `data-contracts-service` (registry)
+- retry/backoff при временных ошибках registry и валидация payload контракта
 - вычисление `row_hash` (SHA-256) по `keys.hash_keys` или всем полям контракта
-- UPSERT в curated-таблицу без физического удаления строк
+- batched обработка изменений и batched UPSERT в curated-таблицу без физического удаления строк
 - аудит запусков в `ingestion_meta.pipeline_state` и `ingestion_meta.run_audit`
+- DB lock пайплайна + checkpoint в `ingestion_meta.pipeline_checkpoint`
 
 - любое удаление данных при отсутствии строки в source
 
@@ -115,12 +117,15 @@ curl -u airflow:airflow -X POST "http://localhost:8088/api/v1/dags/ingest_contra
       "source_dsn": "postgresql+psycopg2://source_user:source_pass@postgres_source:5432/source_db",
       "source_table": "public.orders",
       "target_dsn": "postgresql+psycopg2://target_user:target_pass@postgres_target:5432/target_db",
-      "target_table_curated": "curated.orders"
+      "target_table_curated": "curated.orders",
+      "source_batch_size": 1000,
+      "upsert_batch_size": 1000
     }
   }'
 ```
 
 `contract_version` можно не передавать, тогда используется `active` версия.
+`source_batch_size` и `upsert_batch_size` опциональны (по умолчанию `1000`).
 
 ## 4. Ожидаемый результат синхронизации
 
@@ -137,6 +142,7 @@ curl -u airflow:airflow -X POST "http://localhost:8088/api/v1/dags/ingest_contra
 Аудит:
 - `ingestion_meta.run_audit` содержит детальные метрики запуска
 - `ingestion_meta.pipeline_state` содержит последний статус пайплайна
+- `ingestion_meta.pipeline_checkpoint` хранит последнюю успешную контрольную точку
 
 ## 5. Тесты
 

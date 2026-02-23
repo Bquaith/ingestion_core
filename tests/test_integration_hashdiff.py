@@ -76,12 +76,16 @@ def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
             target_dsn=TEST_TARGET_DSN,
             target_table_curated=target_fqn,
             contract=contract,
+            source_batch_size=2,
+            upsert_batch_size=2,
         )
 
         assert first.read_count == 3
         assert first.insert_count == 3
         assert first.update_count == 0
         assert first.unchanged_count == 0
+        assert first.processed_batches == 2
+        assert first.total_seconds >= 0.0
 
         with source_engine.begin() as conn:
             conn.execute(
@@ -111,12 +115,16 @@ def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
             target_dsn=TEST_TARGET_DSN,
             target_table_curated=target_fqn,
             contract=contract,
+            source_batch_size=2,
+            upsert_batch_size=2,
         )
 
         assert second.read_count == 4
         assert second.insert_count == 1
         assert second.update_count == 1
         assert second.unchanged_count == 2
+        assert second.processed_batches == 2
+        assert second.total_seconds >= 0.0
 
         with target_engine.connect() as conn:
             total = conn.execute(

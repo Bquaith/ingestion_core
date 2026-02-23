@@ -37,6 +37,7 @@ def ensure_audit_tables(engine: Engine) -> None:
             update_count integer NOT NULL DEFAULT 0,
             unchanged_count integer NOT NULL DEFAULT 0,
             status text NOT NULL,
+            metrics_json jsonb,
             error_text text
         )
         """,
@@ -61,6 +62,14 @@ def ensure_audit_tables(engine: Engine) -> None:
     with engine.begin() as conn:
         for statement in statements:
             conn.execute(text(statement))
+        conn.execute(
+            text(
+                """
+                ALTER TABLE ingestion_meta.run_audit
+                ADD COLUMN IF NOT EXISTS metrics_json jsonb
+                """
+            )
+        )
 
 
 def start_run_audit(
@@ -210,8 +219,11 @@ def finish_run_audit(
     insert_count: int,
     update_count: int,
     unchanged_count: int,
+    metrics_json: Mapping[str, Any] | None = None,
     error_text: str | None = None,
 ) -> None:
+    metrics_payload = json.dumps(dict(metrics_json or {}), ensure_ascii=True, sort_keys=True)
+
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -223,6 +235,7 @@ def finish_run_audit(
                     update_count = :update_count,
                     unchanged_count = :unchanged_count,
                     status = :status,
+                    metrics_json = :metrics_json::jsonb,
                     error_text = :error_text
                 WHERE run_id = :run_id
                 """
@@ -234,6 +247,7 @@ def finish_run_audit(
                 "update_count": update_count,
                 "unchanged_count": unchanged_count,
                 "status": status,
+                "metrics_json": metrics_payload,
                 "error_text": error_text,
             },
         )
