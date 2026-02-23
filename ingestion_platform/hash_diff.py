@@ -158,8 +158,15 @@ def _ensure_target_curated_table(
     return target_table
 
 
-def _read_source_rows(source_engine, source_table: Table, fields: Sequence[str]) -> list[dict[str, Any]]:
+def _read_source_rows(
+    source_engine,
+    source_table: Table,
+    fields: Sequence[str],
+    key_fields: Sequence[str],
+) -> list[dict[str, Any]]:
     query = select(*(source_table.c[field] for field in fields))
+    if key_fields:
+        query = query.order_by(*(source_table.c[field] for field in key_fields))
 
     with source_engine.connect() as conn:
         rows = conn.execute(query).mappings().all()
@@ -244,7 +251,12 @@ def run_hash_diff(
             key_fields=contract.key_fields,
         )
 
-        source_rows = _read_source_rows(source_engine, source_table_obj, contract.fields)
+        source_rows = _read_source_rows(
+            source_engine=source_engine,
+            source_table=source_table_obj,
+            fields=contract.fields,
+            key_fields=contract.key_fields,
+        )
         source_rows_with_hashes = _add_row_hashes(source_rows, contract.effective_hash_fields)
 
         existing_hashes = _read_existing_hashes(target_engine, target_table_obj, contract.key_fields)
