@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import Column, MetaData, Numeric, String, Table
 
-from ingestion_platform.hash_diff import ContractDefinition, classify_changes, run_hash_diff
+from ingestion_platform.hash_diff import (
+    ContractDefinition,
+    _validate_source_columns,
+    classify_changes,
+    run_hash_diff,
+)
 
 
 def test_contract_definition_uses_primary_keys_first() -> None:
@@ -94,3 +100,34 @@ def test_run_hash_diff_validates_batch_sizes() -> None:
             contract=contract,
             upsert_batch_size=0,
         )
+
+
+def test_validate_source_columns_fails_on_type_mismatch() -> None:
+    source_table = Table(
+        "orders",
+        MetaData(),
+        Column("order_id", String, nullable=False),
+        Column("amount", String, nullable=False),
+    )
+
+    with pytest.raises(ValueError, match="Source column type mismatch against contract"):
+        _validate_source_columns(
+            source_table=source_table,
+            fields=["order_id", "amount"],
+            field_types={"order_id": "string", "amount": "decimal"},
+        )
+
+
+def test_validate_source_columns_accepts_matching_types() -> None:
+    source_table = Table(
+        "orders",
+        MetaData(),
+        Column("order_id", String, nullable=False),
+        Column("amount", Numeric(12, 2), nullable=False),
+    )
+
+    _validate_source_columns(
+        source_table=source_table,
+        fields=["order_id", "amount"],
+        field_types={"order_id": "string", "amount": "decimal"},
+    )

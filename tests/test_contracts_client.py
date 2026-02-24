@@ -45,7 +45,10 @@ def _contract_payload() -> dict[str, Any]:
             "version": "1",
             "checksum": "abc123",
             "schema_json": {
-                "fields": [{"name": "id"}, {"name": "status"}],
+                "fields": [
+                    {"name": "id", "type": "bigint"},
+                    {"name": "status", "type": "string"},
+                ],
                 "keys": {
                     "primary": ["id"],
                     "business": [],
@@ -76,6 +79,7 @@ def test_fetch_contract_retries_on_transient_status() -> None:
     payload = client.fetch_contract(namespace="sales", name="orders")
 
     assert payload.contract_id == "orders-contract"
+    assert payload.field_types == {"id": "bigint", "status": "string"}
     assert len(session.calls) == 2
     assert sleeps == [0.1]
 

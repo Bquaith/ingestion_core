@@ -35,6 +35,7 @@ class ContractPayload:
     version: str
     checksum: str
     fields: list[str]
+    field_types: dict[str, str]
     primary_keys: list[str]
     business_keys: list[str]
     hash_keys: list[str]
@@ -46,6 +47,7 @@ class ContractPayload:
             "version": self.version,
             "checksum": self.checksum,
             "fields": self.fields,
+            "field_types": self.field_types,
             "primary_keys": self.primary_keys,
             "business_keys": self.business_keys,
             "hash_keys": self.hash_keys,
@@ -169,12 +171,19 @@ class ContractRegistryClient:
         fields_raw = schema_json.get("fields") if isinstance(schema_json.get("fields"), list) else []
 
         fields: list[str] = []
+        field_types: dict[str, str] = {}
         for item in fields_raw:
             if isinstance(item, str):
                 fields.append(item)
                 continue
             if isinstance(item, dict) and item.get("name"):
-                fields.append(str(item["name"]))
+                field_name = str(item["name"])
+                fields.append(field_name)
+                raw_type = item.get("type")
+                if raw_type is not None:
+                    normalized_type = str(raw_type).strip()
+                    if normalized_type:
+                        field_types[field_name] = normalized_type
         if not fields:
             raise ContractPayloadError("Contract payload must include at least one schema field")
 
@@ -192,6 +201,7 @@ class ContractRegistryClient:
             version=self._required_str(version.get("version"), "version.version"),
             checksum=self._required_str(version.get("checksum"), "version.checksum"),
             fields=fields,
+            field_types=field_types,
             primary_keys=primary_keys,
             business_keys=business_keys,
             hash_keys=hash_keys,
