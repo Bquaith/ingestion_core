@@ -1,6 +1,6 @@
 # ingestion-platform
 
-Airflow-ориентированная платформа инкрементальной загрузки данных
+Airflow-ориентированная платформа инкрементальной загрузки данных.
 
 Реализовано:
 - оркестрация через DAG `ingest_contract_hashdiff`
@@ -10,7 +10,6 @@ Airflow-ориентированная платформа инкрементал
 - batched обработка изменений, batched UPSERT и удаление из curated строк, отсутствующих в source
 - аудит запусков в `ingestion_meta.pipeline_state` и `ingestion_meta.run_audit`
 - DB lock пайплайна + checkpoint в `ingestion_meta.pipeline_checkpoint`
-
 
 ## Структура
 
