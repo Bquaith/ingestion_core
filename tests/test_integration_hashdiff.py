@@ -14,7 +14,7 @@ TEST_TARGET_DSN = os.getenv("TEST_TARGET_DSN")
 
 
 @pytest.mark.integration
-def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
+def test_hashdiff_two_runs_insert_update_unchanged_and_delete() -> None:
     if not TEST_SOURCE_DSN or not TEST_TARGET_DSN:
         pytest.skip("Set TEST_SOURCE_DSN and TEST_TARGET_DSN to run integration test")
 
@@ -83,6 +83,7 @@ def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
         assert first.read_count == 3
         assert first.insert_count == 3
         assert first.update_count == 0
+        assert first.delete_count == 0
         assert first.unchanged_count == 0
         assert first.processed_batches == 2
         assert first.total_seconds >= 0.0
@@ -95,6 +96,14 @@ def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
                     SET amount = 125.50,
                         updated_at = '2025-01-02T10:05:00+00:00'
                     WHERE order_id = 2
+                    '''
+                )
+            )
+            conn.execute(
+                text(
+                    f'''
+                    DELETE FROM "public"."{source_table_name}"
+                    WHERE order_id = 3
                     '''
                 )
             )
@@ -119,10 +128,11 @@ def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
             upsert_batch_size=2,
         )
 
-        assert second.read_count == 4
+        assert second.read_count == 3
         assert second.insert_count == 1
         assert second.update_count == 1
-        assert second.unchanged_count == 2
+        assert second.delete_count == 1
+        assert second.unchanged_count == 1
         assert second.processed_batches == 2
         assert second.total_seconds >= 0.0
 
@@ -140,7 +150,7 @@ def test_hashdiff_two_runs_insert_then_update_and_unchanged() -> None:
                 )
             ).scalar_one()
 
-        assert total == 4
+        assert total == 3
         assert amount == "125.50"
     finally:
         with source_engine.begin() as conn:

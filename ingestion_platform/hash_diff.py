@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, select, text, tuple_
+from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, and_, exists, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.sqltypes import Boolean, Date, DateTime, Integer, JSON, LargeBinary, Numeric, String, Time
 
@@ -86,6 +87,7 @@ class HashDiffResult:
     read_count: int
     insert_count: int
     update_count: int
+    delete_count: int
     unchanged_count: int
     processed_batches: int
     source_read_seconds: float
@@ -100,6 +102,7 @@ class HashDiffResult:
             "diff_seconds": self.diff_seconds,
             "write_seconds": self.write_seconds,
             "total_seconds": self.total_seconds,
+            "delete_count": self.delete_count,
         }
 
 
@@ -338,6 +341,76 @@ def _ensure_target_curated_table(
     return target_table
 
 
+def _make_key_staging_table_name(target_table_name: str) -> str:
+    suffix = uuid.uuid4().hex[:10]
+    return f"_hd_keys_{target_table_name}_{suffix}"[:63]
+
+
+def _create_key_staging_table(
+    target_engine,
+    target_schema: str,
+    target_table: Table,
+    key_fields: Sequence[str],
+) -> Table:
+    metadata = MetaData()
+    staging_table = Table(
+        _make_key_staging_table_name(target_table.name),
+        metadata,
+        *(Column(field, target_table.c[field].type, nullable=True) for field in key_fields),
+        schema=target_schema,
+    )
+    metadata.create_all(target_engine, tables=[staging_table], checkfirst=False)
+    return staging_table
+
+
+def _stage_source_keys(
+    target_engine,
+    staging_table: Table,
+    key_fields: Sequence[str],
+    key_tuples: Sequence[tuple[Any, ...]],
+    batch_size: int,
+) -> None:
+    if not key_tuples:
+        return
+
+    unique_keys = list(dict.fromkeys(key_tuples))
+    key_rows = [
+        {field: key_tuple[index] for index, field in enumerate(key_fields)}
+        for key_tuple in unique_keys
+    ]
+
+    with target_engine.begin() as conn:
+        for key_rows_chunk in _chunk_rows(key_rows, batch_size):
+            conn.execute(staging_table.insert(), key_rows_chunk)
+
+
+def _delete_missing_target_rows(
+    target_engine,
+    target_table: Table,
+    staging_table: Table,
+    key_fields: Sequence[str],
+) -> int:
+    key_match_predicate = and_(
+        *(
+            target_table.c[field].is_not_distinct_from(staging_table.c[field])
+            for field in key_fields
+        )
+    )
+    source_key_exists = exists(
+        select(1).select_from(staging_table).where(key_match_predicate)
+    )
+    delete_stmt = target_table.delete().where(~source_key_exists)
+
+    with target_engine.begin() as conn:
+        result = conn.execute(delete_stmt)
+
+    return int(result.rowcount or 0)
+
+
+def _drop_staging_table(target_engine, staging_table: Table) -> None:
+    staging_table.drop(target_engine, checkfirst=True)
+
+
 def _iter_source_row_batches(
     source_engine,
     source_table: Table,
@@ -458,8 +531,10 @@ def run_hash_diff(
     read_count = 0
     insert_count = 0
     update_count = 0
+    delete_count = 0
     unchanged_count = 0
     processed_batches = 0
+    staged_keys_table: Table | None = None
 
     try:
         source_schema, source_name = parse_table_name(source_table)
@@ -481,53 +556,80 @@ def run_hash_diff(
             key_fields=contract.key_fields,
         )
 
-        for source_batch, fetch_seconds in _iter_source_row_batches(
-            source_engine=source_engine,
-            source_table=source_table_obj,
-            fields=contract.fields,
+        staged_keys_table = _create_key_staging_table(
+            target_engine=target_engine,
+            target_schema=target_schema,
+            target_table=target_table_obj,
             key_fields=contract.key_fields,
-            source_batch_size=source_batch_size,
-        ):
-            processed_batches += 1
-            read_seconds += fetch_seconds
-            read_count += len(source_batch)
+        )
 
-            diff_started = perf_counter()
-            source_rows_with_hashes = _add_row_hashes(source_batch, contract.effective_hash_fields)
-            batch_keys = [build_row_key(row, contract.key_fields) for row in source_rows_with_hashes]
-            existing_hashes = _read_existing_hashes_for_keys(
-                target_engine=target_engine,
-                target_table=target_table_obj,
-                key_fields=contract.key_fields,
-                key_tuples=batch_keys,
-            )
-            inserts, updates, unchanged_batch = classify_changes(
-                source_rows=source_rows_with_hashes,
-                existing_hashes=existing_hashes,
-                key_fields=contract.key_fields,
-            )
-            diff_seconds += perf_counter() - diff_started
-
-            unchanged_count += unchanged_batch
-            insert_count += len(inserts)
-            update_count += len(updates)
-
-            write_started = perf_counter()
-            _upsert_rows(
-                target_engine=target_engine,
-                target_table=target_table_obj,
-                rows=[*inserts, *updates],
-                key_fields=contract.key_fields,
+        try:
+            for source_batch, fetch_seconds in _iter_source_row_batches(
+                source_engine=source_engine,
+                source_table=source_table_obj,
                 fields=contract.fields,
-                upsert_batch_size=upsert_batch_size,
+                key_fields=contract.key_fields,
+                source_batch_size=source_batch_size,
+            ):
+                processed_batches += 1
+                read_seconds += fetch_seconds
+                read_count += len(source_batch)
+
+                diff_started = perf_counter()
+                source_rows_with_hashes = _add_row_hashes(source_batch, contract.effective_hash_fields)
+                batch_keys = [build_row_key(row, contract.key_fields) for row in source_rows_with_hashes]
+                _stage_source_keys(
+                    target_engine=target_engine,
+                    staging_table=staged_keys_table,
+                    key_fields=contract.key_fields,
+                    key_tuples=batch_keys,
+                    batch_size=upsert_batch_size,
+                )
+                existing_hashes = _read_existing_hashes_for_keys(
+                    target_engine=target_engine,
+                    target_table=target_table_obj,
+                    key_fields=contract.key_fields,
+                    key_tuples=batch_keys,
+                )
+                inserts, updates, unchanged_batch = classify_changes(
+                    source_rows=source_rows_with_hashes,
+                    existing_hashes=existing_hashes,
+                    key_fields=contract.key_fields,
+                )
+                diff_seconds += perf_counter() - diff_started
+
+                unchanged_count += unchanged_batch
+                insert_count += len(inserts)
+                update_count += len(updates)
+
+                write_started = perf_counter()
+                _upsert_rows(
+                    target_engine=target_engine,
+                    target_table=target_table_obj,
+                    rows=[*inserts, *updates],
+                    key_fields=contract.key_fields,
+                    fields=contract.fields,
+                    upsert_batch_size=upsert_batch_size,
+                )
+                write_seconds += perf_counter() - write_started
+
+            delete_started = perf_counter()
+            delete_count = _delete_missing_target_rows(
+                target_engine=target_engine,
+                target_table=target_table_obj,
+                staging_table=staged_keys_table,
+                key_fields=contract.key_fields,
             )
-            write_seconds += perf_counter() - write_started
+            write_seconds += perf_counter() - delete_started
+        finally:
+            _drop_staging_table(target_engine=target_engine, staging_table=staged_keys_table)
 
         total_seconds = perf_counter() - started_at
         return HashDiffResult(
             read_count=read_count,
             insert_count=insert_count,
             update_count=update_count,
+            delete_count=delete_count,
             unchanged_count=unchanged_count,
             processed_batches=processed_batches,
             source_read_seconds=read_seconds,
