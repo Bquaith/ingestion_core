@@ -193,7 +193,7 @@ def persist_pipeline_checkpoint(
                 ) VALUES (
                     :pipeline_id,
                     :run_id,
-                    :checkpoint_json::jsonb,
+                    CAST(:checkpoint_json AS jsonb),
                     now()
                 )
                 ON CONFLICT (pipeline_id)
@@ -235,7 +235,7 @@ def finish_run_audit(
                     update_count = :update_count,
                     unchanged_count = :unchanged_count,
                     status = :status,
-                    metrics_json = :metrics_json::jsonb,
+                    metrics_json = CAST(:metrics_json AS jsonb),
                     error_text = :error_text
                 WHERE run_id = :run_id
                 """

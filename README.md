@@ -7,11 +7,10 @@ Airflow-ориентированная платформа инкрементал
 - интеграция с `data-contracts-service` (registry)
 - retry/backoff при временных ошибках registry и валидация payload контракта
 - вычисление `row_hash` (SHA-256) по `keys.hash_keys` или всем полям контракта
-- batched обработка изменений и batched UPSERT в curated-таблицу без физического удаления строк
+- batched обработка изменений, batched UPSERT и удаление из curated строк, отсутствующих в source
 - аудит запусков в `ingestion_meta.pipeline_state` и `ingestion_meta.run_audit`
 - DB lock пайплайна + checkpoint в `ingestion_meta.pipeline_checkpoint`
 
-- любое удаление данных при отсутствии строки в source
 
 ## Структура
 
@@ -40,6 +39,19 @@ ingestion-platform/
   README.md
 ```
 
+## Установка зависимостей
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-test.txt
+```
+
+Отдельно для Airflow-окружения (в другом env/образе):
+
+```bash
+pip install -r requirements-airflow.txt
+```
+
 ## 1. Запуск Docker Compose
 
 ```bash
@@ -56,11 +68,20 @@ docker compose up --build -d
 
 Переменная для registry:
 - `CONTRACTS_SERVICE_URL` (по умолчанию `http://host.docker.internal:8081`)
+- `AIRFLOW_METADATA_DSN` (опционально, DSN metadata БД Airflow; по умолчанию `postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/target_db`)
 
 Пример запуска с явным registry:
 
 ```bash
 CONTRACTS_SERVICE_URL=http://host.docker.internal:8081 docker compose up --build -d
+```
+
+Пример запуска с внешней metadata БД:
+
+```bash
+AIRFLOW_METADATA_DSN='postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/postgres' \
+CONTRACTS_SERVICE_URL=http://host.docker.internal:8081 \
+docker compose up --build -d
 ```
 
 ## 2. Пример контракта для registry
@@ -137,7 +158,7 @@ curl -u airflow:airflow -X POST "http://localhost:8088/api/v1/dags/ingest_contra
 - новые ключи -> `INSERT`
 - существующие ключи с другим хэшем -> `UPDATE`
 - строки с тем же хэшем -> `UNCHANGED`
-- отсутствующие в source строки не удаляются из target
+- отсутствующие в source строки удаляются из target (`DELETE`)
 
 Аудит:
 - `ingestion_meta.run_audit` содержит детальные метрики запуска
@@ -161,4 +182,3 @@ export TEST_SOURCE_DSN='postgresql+psycopg2://source_user:source_pass@localhost:
 export TEST_TARGET_DSN='postgresql+psycopg2://target_user:target_pass@localhost:5434/target_db'
 pytest tests/test_integration_hashdiff.py -m integration
 ```
-
