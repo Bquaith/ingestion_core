@@ -9,8 +9,8 @@ from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, and_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.sqltypes import Boolean, Date, DateTime, Integer, JSON, LargeBinary, Numeric, String, Time
 
-from ingestion_platform.hashing import calculate_row_hash
-from ingestion_platform.postgres import (
+from ingestion_core.hashing import calculate_row_hash
+from ingestion_core.postgres import (
     create_sqlalchemy_engine,
     ensure_schema,
     parse_table_name,

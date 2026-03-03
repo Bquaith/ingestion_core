@@ -1,7 +1,6 @@
-"""ingestion_platform package."""
+"""ingestion_core package."""
 
 __all__ = [
-    "config",
     "contracts_client",
     "hashing",
     "postgres",

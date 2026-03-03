@@ -4,7 +4,7 @@ import hashlib
 from datetime import date, datetime
 from decimal import Decimal
 
-from ingestion_platform.hashing import NULL_SENTINEL, calculate_row_hash, canonical_serialize, serialize_row
+from ingestion_core.hashing import NULL_SENTINEL, calculate_row_hash, canonical_serialize, serialize_row
 
 
 def test_canonical_serialize_rules() -> None:

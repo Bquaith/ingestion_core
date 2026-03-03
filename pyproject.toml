@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ingestion-platform"
+name = "ingestion-core"
 version = "0.1.0"
-description = "Airflow-based incremental ingestion platform with hash-diff strategy"
+description = "Reusable hash-diff ingestion engine and contract registry client"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -24,4 +24,4 @@ test = [
 ]
 
 [tool.setuptools]
-packages = ["ingestion_platform"]
+packages = ["ingestion_core"]

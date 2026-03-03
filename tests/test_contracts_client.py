@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 import requests
 
-from ingestion_platform.contracts_client import (
+from ingestion_core.contracts_client import (
     ContractPayloadError,
     ContractRegistryClient,
     ContractRegistryHTTPError,

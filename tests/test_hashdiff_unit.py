@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import Column, MetaData, Numeric, String, Table
 
-from ingestion_platform.hash_diff import (
+from ingestion_core.hash_diff import (
     ContractDefinition,
     _validate_source_columns,
     classify_changes,
