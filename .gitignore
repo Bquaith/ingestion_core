@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 .python-version
 .venv/
+build/
+ingestion_platform.egg-info

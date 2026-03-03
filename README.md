@@ -134,9 +134,9 @@ curl -u airflow:airflow -X POST "http://localhost:8088/api/v1/dags/ingest_contra
       "namespace": "sales",
       "name": "orders",
       "contract_version": "1",
-      "source_dsn": "postgresql+psycopg2://source_user:source_pass@postgres_source:5432/source_db",
+      "source_dsn": "postgresql+psycopg2://postgres:postgres@localhost:5432/source_db",
       "source_table": "public.orders",
-      "target_dsn": "postgresql+psycopg2://target_user:target_pass@postgres_target:5432/target_db",
+      "target_dsn": "postgresql+psycopg2://postgres:postgres@localhost:5432/target_db",
       "target_table_curated": "curated.orders",
       "source_batch_size": 1000,
       "upsert_batch_size": 1000
@@ -177,7 +177,7 @@ Integration-тест:
 
 ```bash
 cd ingestion-platform
-export TEST_SOURCE_DSN='postgresql+psycopg2://source_user:source_pass@localhost:5433/source_db'
-export TEST_TARGET_DSN='postgresql+psycopg2://target_user:target_pass@localhost:5434/target_db'
+export TEST_SOURCE_DSN='postgresql+psycopg2://postgres:postgres@localhost:5432/source_db'
+export TEST_TARGET_DSN='postgresql+psycopg2://postgres:postgres@localhost:5432/target_db'
 pytest tests/test_integration_hashdiff.py -m integration
 ```
