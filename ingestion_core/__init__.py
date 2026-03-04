@@ -6,4 +6,5 @@ __all__ = [
     "postgres",
     "hash_diff",
     "audit",
+    "db",
 ]

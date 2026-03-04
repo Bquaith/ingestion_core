@@ -22,6 +22,12 @@ test = [
   "pytest==8.3.4",
   "pytest-cov==6.0.0"
 ]
+dev = [
+  "pytest==8.3.4",
+  "pytest-cov==6.0.0",
+  "build>=1.2,<2"
+]
 
 [tool.setuptools]
-packages = ["ingestion_core"]
+[tool.setuptools.packages.find]
+include = ["ingestion_core*"]

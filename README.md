@@ -11,29 +11,6 @@
 
 Airflow orchestration и Docker runtime вынесены в отдельный репозиторий `ingestion-airflow`.
 
-## Структура
-
-```text
-ingestion-core/
-  ingestion_core/
-    __init__.py
-    audit.py
-    contracts_client.py
-    hash_diff.py
-    hashing.py
-    postgres.py
-  tests/
-    test_audit_checkpoint.py
-    test_contracts_client.py
-    test_hashdiff_unit.py
-    test_hashing.py
-    test_integration_hashdiff.py
-  pyproject.toml
-  pytest.ini
-  requirements.txt
-  requirements-test.txt
-  tox.ini
-```
 
 ## Установка
 
@@ -46,6 +23,12 @@ Editable install:
 
 ```bash
 pip install -e .
+```
+
+Dev tooling:
+
+```bash
+make install-dev
 ```
 
 ## Пример contract payload
@@ -119,3 +102,12 @@ export TEST_SOURCE_DSN='postgresql+psycopg2://source_user:source_pass@localhost:
 export TEST_TARGET_DSN='postgresql+psycopg2://target_user:target_pass@localhost:5434/target_db'
 tox -e integration
 ```
+
+## Build And Migrations
+
+Build:
+
+```bash
+make build
+```
+
