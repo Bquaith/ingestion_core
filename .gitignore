@@ -11,3 +11,4 @@ __pycache__/
 build/
 dist/
 ingestion_core.egg-info/*
+.vscode
