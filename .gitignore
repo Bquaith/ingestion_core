@@ -9,4 +9,5 @@ __pycache__/
 .python-version
 .venv/
 build/
+dist/
 ingestion_core.egg-info/*
