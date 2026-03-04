@@ -6,7 +6,7 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from ingestion_core.hash_diff import ContractDefinition, run_hash_diff
+from ingestion_core.hash_diff import ContractDefinition, _make_hash_state_table_name, run_hash_diff
 from ingestion_core.postgres import create_sqlalchemy_engine
 
 TEST_SOURCE_DSN = os.getenv("TEST_SOURCE_DSN")
@@ -21,6 +21,7 @@ def test_hashdiff_two_runs_insert_update_unchanged_and_delete() -> None:
     suffix = uuid.uuid4().hex[:8]
     source_table_name = f"orders_it_{suffix}"
     target_table_name = f"orders_curated_it_{suffix}"
+    hash_state_table_name = _make_hash_state_table_name(target_table_name)
 
     source_fqn = f"public.{source_table_name}"
     target_fqn = f"curated.{target_table_name}"
@@ -149,13 +150,37 @@ def test_hashdiff_two_runs_insert_update_unchanged_and_delete() -> None:
                     '''
                 )
             ).scalar_one()
+            target_columns = conn.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'curated'
+                      AND table_name = :table_name
+                    ORDER BY ordinal_position
+                    """
+                ),
+                {"table_name": target_table_name},
+            ).scalars().all()
+            hash_state_keys = conn.execute(
+                text(
+                    f'''
+                    SELECT order_id
+                    FROM "curated"."{hash_state_table_name}"
+                    ORDER BY order_id
+                    '''
+                )
+            ).scalars().all()
 
         assert total == 3
         assert amount == "125.50"
+        assert "row_hash" not in target_columns
+        assert hash_state_keys == [1, 2, 4]
     finally:
         with source_engine.begin() as conn:
             conn.execute(text(f'DROP TABLE IF EXISTS "public"."{source_table_name}"'))
         with target_engine.begin() as conn:
+            conn.execute(text(f'DROP TABLE IF EXISTS "curated"."{hash_state_table_name}"'))
             conn.execute(text(f'DROP TABLE IF EXISTS "curated"."{target_table_name}"'))
 
         source_engine.dispose()

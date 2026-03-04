@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, and_, exists, select, text, tuple_
+from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, and_, exists, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.sqltypes import Boolean, Date, DateTime, Integer, JSON, LargeBinary, Numeric, String, Time
 
@@ -285,20 +285,8 @@ def _validate_source_columns(
         )
 
 
-def _make_index_name(table_name: str, suffix: str) -> str:
-    return f"idx_{table_name}_{suffix}"[:63]
-
-
-def _ensure_target_indexes(target_engine, target_schema: str, target_table_name: str) -> None:
-    row_hash_index_name = _make_index_name(target_table_name, "row_hash")
-
-    with target_engine.begin() as conn:
-        conn.execute(
-            text(
-                f'CREATE INDEX IF NOT EXISTS "{row_hash_index_name}" '
-                f'ON "{target_schema}"."{target_table_name}" ("row_hash")'
-            )
-        )
+def _make_hash_state_table_name(target_table_name: str) -> str:
+    return f"_hd_state_{target_table_name}"[:63]
 
 
 def _ensure_target_curated_table(
@@ -320,8 +308,6 @@ def _ensure_target_curated_table(
             nullable = source_column.nullable and field not in key_fields
             columns.append(Column(field, source_column.type, nullable=nullable))
 
-        columns.append(Column("row_hash", Text, nullable=False))
-
         table = Table(
             target_table_name,
             metadata,
@@ -333,12 +319,48 @@ def _ensure_target_curated_table(
         metadata.create_all(target_engine, tables=[table], checkfirst=True)
 
     target_table = reflect_table(target_engine, target_schema, target_table_name)
-    missing_columns = (set(fields) | {"row_hash"}) - set(target_table.columns.keys())
+    missing_columns = set(fields) - set(target_table.columns.keys())
     if missing_columns:
         raise ValueError(f"Target table is missing required columns: {sorted(missing_columns)}")
 
-    _ensure_target_indexes(target_engine, target_schema, target_table_name)
     return target_table
+
+
+def _ensure_hash_state_table(
+    target_engine,
+    target_schema: str,
+    target_table_name: str,
+    target_table: Table,
+    key_fields: Sequence[str],
+) -> Table:
+    hash_state_table_name = _make_hash_state_table_name(target_table_name)
+
+    if not table_exists(target_engine, target_schema, hash_state_table_name):
+        metadata = MetaData()
+        columns = [
+            Column(field, target_table.c[field].type, nullable=target_table.c[field].nullable)
+            for field in key_fields
+        ]
+        columns.append(Column("row_hash", Text, nullable=False))
+
+        table = Table(
+            hash_state_table_name,
+            metadata,
+            *columns,
+            PrimaryKeyConstraint(*key_fields, name=f"pk_{hash_state_table_name}"[:63]),
+            schema=target_schema,
+        )
+        metadata.create_all(target_engine, tables=[table], checkfirst=True)
+
+    hash_state_table = reflect_table(target_engine, target_schema, hash_state_table_name)
+    missing_columns = set(key_fields) | {"row_hash"}
+    actual_columns = set(hash_state_table.columns.keys())
+    if not missing_columns.issubset(actual_columns):
+        raise ValueError(
+            f"Hash state table is missing required columns: {sorted(missing_columns - actual_columns)}"
+        )
+
+    return hash_state_table
 
 
 def _make_key_staging_table_name(target_table_name: str) -> str:
@@ -384,29 +406,6 @@ def _stage_source_keys(
             conn.execute(staging_table.insert(), key_rows_chunk)
 
 
-def _delete_missing_target_rows(
-    target_engine,
-    target_table: Table,
-    staging_table: Table,
-    key_fields: Sequence[str],
-) -> int:
-    key_match_predicate = and_(
-        *(
-            target_table.c[field].is_not_distinct_from(staging_table.c[field])
-            for field in key_fields
-        )
-    )
-    source_key_exists = exists(
-        select(1).select_from(staging_table).where(key_match_predicate)
-    )
-    delete_stmt = target_table.delete().where(~source_key_exists)
-
-    with target_engine.begin() as conn:
-        result = conn.execute(delete_stmt)
-
-    return int(result.rowcount or 0)
-
-
 def _drop_staging_table(target_engine, staging_table: Table) -> None:
     staging_table.drop(target_engine, checkfirst=True)
 
@@ -449,7 +448,7 @@ def _add_row_hashes(rows: Sequence[Mapping[str, Any]], hash_fields: Sequence[str
 
 def _read_existing_hashes_for_keys(
     target_engine,
-    target_table: Table,
+    hash_state_table: Table,
     key_fields: Sequence[str],
     key_tuples: Sequence[tuple[Any, ...]],
 ) -> dict[tuple[Any, ...], str]:
@@ -462,12 +461,12 @@ def _read_existing_hashes_for_keys(
         if len(key_fields) == 1:
             key_field = key_fields[0]
             key_values = [key[0] for key in unique_keys]
-            query = select(target_table.c[key_field], target_table.c.row_hash).where(
-                target_table.c[key_field].in_(key_values)
+            query = select(hash_state_table.c[key_field], hash_state_table.c.row_hash).where(
+                hash_state_table.c[key_field].in_(key_values)
             )
         else:
-            key_columns = [target_table.c[field] for field in key_fields]
-            query = select(*key_columns, target_table.c.row_hash).where(
+            key_columns = [hash_state_table.c[field] for field in key_fields]
+            query = select(*key_columns, hash_state_table.c.row_hash).where(
                 tuple_(*key_columns).in_(unique_keys)
             )
 
@@ -481,9 +480,10 @@ def _chunk_rows(rows: Sequence[Mapping[str, Any]], chunk_size: int) -> Iterable[
         yield list(rows[index : index + chunk_size])
 
 
-def _upsert_rows(
+def _upsert_changed_rows(
     target_engine,
     target_table: Table,
+    hash_state_table: Table,
     rows: Sequence[Mapping[str, Any]],
     key_fields: Sequence[str],
     fields: Sequence[str],
@@ -492,18 +492,69 @@ def _upsert_rows(
     if not rows:
         return
 
-    update_fields = [field for field in fields if field not in key_fields] + ["row_hash"]
+    target_update_fields = [field for field in fields if field not in key_fields]
 
     with target_engine.begin() as conn:
         # Keep statement deterministic for testing/debugging
         sorted_rows = sorted(rows, key=lambda row: build_row_key(row, key_fields))
         for rows_chunk in _chunk_rows(sorted_rows, upsert_batch_size):
-            insert_stmt = pg_insert(target_table).values(rows_chunk)
-            upsert_stmt = insert_stmt.on_conflict_do_update(
+            target_rows_chunk = [
+                {field: row[field] for field in fields}
+                for row in rows_chunk
+            ]
+            target_insert_stmt = pg_insert(target_table).values(target_rows_chunk)
+            if target_update_fields:
+                target_upsert_stmt = target_insert_stmt.on_conflict_do_update(
+                    index_elements=list(key_fields),
+                    set_={field: target_insert_stmt.excluded[field] for field in target_update_fields},
+                )
+            else:
+                target_upsert_stmt = target_insert_stmt.on_conflict_do_nothing(
+                    index_elements=list(key_fields),
+                )
+            conn.execute(target_upsert_stmt)
+
+            hash_rows_chunk = [
+                {
+                    **{field: row[field] for field in key_fields},
+                    "row_hash": row["row_hash"],
+                }
+                for row in rows_chunk
+            ]
+            hash_insert_stmt = pg_insert(hash_state_table).values(hash_rows_chunk)
+            hash_upsert_stmt = hash_insert_stmt.on_conflict_do_update(
                 index_elements=list(key_fields),
-                set_={field: insert_stmt.excluded[field] for field in update_fields},
+                set_={"row_hash": hash_insert_stmt.excluded.row_hash},
             )
-            conn.execute(upsert_stmt)
+            conn.execute(hash_upsert_stmt)
+
+
+def _delete_missing_rows(
+    target_engine,
+    target_table: Table,
+    hash_state_table: Table,
+    staging_table: Table,
+    key_fields: Sequence[str],
+) -> int:
+    target_delete_count = 0
+
+    with target_engine.begin() as conn:
+        for table in (target_table, hash_state_table):
+            key_match_predicate = and_(
+                *(
+                    table.c[field].is_not_distinct_from(staging_table.c[field])
+                    for field in key_fields
+                )
+            )
+            source_key_exists = exists(
+                select(1).select_from(staging_table).where(key_match_predicate)
+            )
+            delete_stmt = table.delete().where(~source_key_exists)
+            result = conn.execute(delete_stmt)
+            if table is target_table:
+                target_delete_count = int(result.rowcount or 0)
+
+    return target_delete_count
 
 
 def run_hash_diff(
@@ -535,6 +586,7 @@ def run_hash_diff(
     unchanged_count = 0
     processed_batches = 0
     staged_keys_table: Table | None = None
+    hash_state_table: Table | None = None
 
     try:
         source_schema, source_name = parse_table_name(source_table)
@@ -553,6 +605,13 @@ def run_hash_diff(
             target_table_name=target_name,
             source_table=source_table_obj,
             fields=contract.fields,
+            key_fields=contract.key_fields,
+        )
+        hash_state_table = _ensure_hash_state_table(
+            target_engine=target_engine,
+            target_schema=target_schema,
+            target_table_name=target_name,
+            target_table=target_table_obj,
             key_fields=contract.key_fields,
         )
 
@@ -587,7 +646,7 @@ def run_hash_diff(
                 )
                 existing_hashes = _read_existing_hashes_for_keys(
                     target_engine=target_engine,
-                    target_table=target_table_obj,
+                    hash_state_table=hash_state_table,
                     key_fields=contract.key_fields,
                     key_tuples=batch_keys,
                 )
@@ -603,9 +662,10 @@ def run_hash_diff(
                 update_count += len(updates)
 
                 write_started = perf_counter()
-                _upsert_rows(
+                _upsert_changed_rows(
                     target_engine=target_engine,
                     target_table=target_table_obj,
+                    hash_state_table=hash_state_table,
                     rows=[*inserts, *updates],
                     key_fields=contract.key_fields,
                     fields=contract.fields,
@@ -614,9 +674,10 @@ def run_hash_diff(
                 write_seconds += perf_counter() - write_started
 
             delete_started = perf_counter()
-            delete_count = _delete_missing_target_rows(
+            delete_count = _delete_missing_rows(
                 target_engine=target_engine,
                 target_table=target_table_obj,
+                hash_state_table=hash_state_table,
                 staging_table=staged_keys_table,
                 key_fields=contract.key_fields,
             )
