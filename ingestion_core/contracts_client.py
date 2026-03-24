@@ -90,6 +90,80 @@ class ContractRegistryClient:
             raise ContractPayloadError(f"Contract payload field '{field_name}' is required")
         return text_value
 
+    def _map_json_schema_property_type(self, property_schema: dict[str, Any]) -> str | None:
+        raw_type = property_schema.get("type")
+        schema_type: str | None = None
+
+        if isinstance(raw_type, str):
+            schema_type = raw_type
+        elif isinstance(raw_type, list):
+            candidates = [item for item in raw_type if isinstance(item, str) and item != "null"]
+            if candidates:
+                schema_type = candidates[0]
+
+        if not schema_type:
+            return None
+
+        normalized = schema_type.strip().lower()
+        if normalized == "string":
+            raw_format = property_schema.get("format")
+            if isinstance(raw_format, str):
+                fmt = raw_format.strip().lower()
+                if fmt == "date-time":
+                    return "timestamp"
+                if fmt == "date":
+                    return "date"
+                if fmt == "time":
+                    return "time"
+                if fmt == "uuid":
+                    return "uuid"
+            return "string"
+        if normalized == "integer":
+            return "integer"
+        if normalized == "number":
+            return "decimal"
+        if normalized == "boolean":
+            return "boolean"
+        if normalized == "array":
+            return "array"
+        if normalized == "object":
+            return "json"
+        return normalized
+
+    def _extract_fields_and_types(self, schema_json: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+        fields: list[str] = []
+        field_types: dict[str, str] = {}
+
+        fields_raw = schema_json.get("fields") if isinstance(schema_json.get("fields"), list) else []
+        for item in fields_raw:
+            if isinstance(item, str):
+                fields.append(item)
+                continue
+            if isinstance(item, dict) and item.get("name"):
+                field_name = str(item["name"])
+                fields.append(field_name)
+                raw_type = item.get("type")
+                if raw_type is not None:
+                    normalized_type = str(raw_type).strip()
+                    if normalized_type:
+                        field_types[field_name] = normalized_type
+
+        if fields:
+            return fields, field_types
+
+        properties = schema_json.get("properties") if isinstance(schema_json.get("properties"), dict) else {}
+        for field_name, property_schema in properties.items():
+            if not isinstance(field_name, str) or not field_name.strip():
+                continue
+            clean_name = field_name.strip()
+            fields.append(clean_name)
+            if isinstance(property_schema, dict):
+                mapped_type = self._map_json_schema_property_type(property_schema)
+                if mapped_type:
+                    field_types[clean_name] = mapped_type
+
+        return fields, field_types
+
     def _is_retriable_status(self, status_code: int) -> bool:
         return status_code in self.RETRIABLE_STATUS_CODES
 
@@ -168,32 +242,25 @@ class ContractRegistryClient:
         if not isinstance(schema_json, dict):
             raise ContractPayloadError("Contract payload must include schema_json object")
 
-        fields_raw = schema_json.get("fields") if isinstance(schema_json.get("fields"), list) else []
-
-        fields: list[str] = []
-        field_types: dict[str, str] = {}
-        for item in fields_raw:
-            if isinstance(item, str):
-                fields.append(item)
-                continue
-            if isinstance(item, dict) and item.get("name"):
-                field_name = str(item["name"])
-                fields.append(field_name)
-                raw_type = item.get("type")
-                if raw_type is not None:
-                    normalized_type = str(raw_type).strip()
-                    if normalized_type:
-                        field_types[field_name] = normalized_type
+        fields, field_types = self._extract_fields_and_types(schema_json)
         if not fields:
-            raise ContractPayloadError("Contract payload must include at least one schema field")
+            raise ContractPayloadError("Contract payload must include at least one schema field/property")
 
         keys = schema_json.get("keys") if isinstance(schema_json.get("keys"), dict) else {}
 
         primary_keys = [str(v) for v in (keys.get("primary") or [])]
         if not primary_keys:
             primary_keys = [str(v) for v in (schema_json.get("primary_key") or [])]
+        if not primary_keys:
+            primary_keys = [str(v) for v in (schema_json.get("x-primaryKey") or [])]
         business_keys = [str(v) for v in (keys.get("business") or [])]
+        if not business_keys:
+            business_keys = [str(v) for v in (schema_json.get("x-businessKey") or [])]
         hash_keys = [str(v) for v in (keys.get("hash_keys") or [])]
+        if not hash_keys:
+            hash_keys = [str(v) for v in (schema_json.get("x-hashKey") or [])]
+        if not hash_keys:
+            hash_keys = [str(v) for v in (schema_json.get("x-hashKeys") or [])]
 
         return ContractPayload(
             contract_id=self._required_str(contract.get("id"), "contract.id"),

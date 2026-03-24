@@ -49,18 +49,19 @@ make install-dev
     "version": "1",
     "checksum": "sha256:3f6c...",
     "schema_json": {
-      "fields": [
-        {"name": "order_id", "type": "bigint"},
-        {"name": "customer_id", "type": "bigint"},
-        {"name": "amount", "type": "decimal"},
-        {"name": "status", "type": "string"},
-        {"name": "updated_at", "type": "timestamp"}
-      ],
-      "keys": {
-        "primary": ["order_id"],
-        "business": [],
-        "hash_keys": ["customer_id", "amount", "status", "updated_at"]
-      }
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "order_id": {"type": "integer"},
+        "customer_id": {"type": "integer"},
+        "amount": {"type": "number"},
+        "status": {"type": "string"},
+        "updated_at": {"type": "string", "format": "date-time"}
+      },
+      "required": ["order_id"],
+      "additionalProperties": false,
+      "x-primaryKey": ["order_id"],
+      "x-businessKey": []
     }
   }
 }
@@ -110,4 +111,3 @@ Build:
 ```bash
 make build
 ```
-
