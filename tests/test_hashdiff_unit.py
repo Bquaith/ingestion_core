@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import Column, MetaData, Numeric, String, Table
+from sqlalchemy.dialects.postgresql import JSONB
 
 from ingestion_core.hash_diff import (
     ContractDefinition,
@@ -39,6 +40,23 @@ def test_contract_definition_requires_keys() -> None:
                 "checksum": "abc",
                 "fields": ["id", "status"],
                 "primary_keys": [],
+                "business_keys": [],
+                "hash_keys": [],
+            }
+        )
+
+
+def test_contract_definition_rejects_unknown_required_fields() -> None:
+    with pytest.raises(ValueError, match="Required fields are absent in fields"):
+        ContractDefinition.from_registry_payload(
+            {
+                "contract_id": "c1",
+                "target_layer": "curated",
+                "version": "1",
+                "checksum": "abc",
+                "fields": ["id", "status"],
+                "required_fields": ["missing_field"],
+                "primary_keys": ["id"],
                 "business_keys": [],
                 "hash_keys": [],
             }
@@ -130,4 +148,19 @@ def test_validate_source_columns_accepts_matching_types() -> None:
         source_table=source_table,
         fields=["order_id", "amount"],
         field_types={"order_id": "string", "amount": "decimal"},
+    )
+
+
+def test_validate_source_columns_accepts_json_columns_for_array_contracts() -> None:
+    source_table = Table(
+        "orders",
+        MetaData(),
+        Column("order_id", String, nullable=False),
+        Column("tags", JSONB, nullable=True),
+    )
+
+    _validate_source_columns(
+        source_table=source_table,
+        fields=["order_id", "tags"],
+        field_types={"order_id": "string", "tags": "array"},
     )

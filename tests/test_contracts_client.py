@@ -101,6 +101,7 @@ def test_fetch_contract_retries_on_transient_status() -> None:
     payload = client.fetch_contract(namespace="sales", name="orders")
 
     assert payload.contract_id == "orders-contract"
+    assert payload.schema_json["type"] == "object"
     assert payload.field_types == {"id": "integer", "status": "string"}
     assert payload.primary_keys == ["id"]
     assert len(session.calls) == 2
@@ -154,8 +155,10 @@ def test_parse_payload_supports_legacy_schema_shape() -> None:
 
     parsed = client._parse_payload(_contract_payload_legacy())
 
+    assert parsed.schema_json["fields"][0]["name"] == "id"
     assert parsed.fields == ["id", "status"]
     assert parsed.field_types == {"id": "bigint", "status": "string"}
+    assert parsed.required_fields == []
     assert parsed.primary_keys == ["id"]
     assert parsed.hash_keys == ["status"]
 
@@ -193,9 +196,36 @@ def test_parse_payload_extracts_types_and_extensions_from_json_schema() -> None:
         "created_at": "timestamp",
         "event_date": "date",
     }
+    assert parsed.required_fields == []
     assert parsed.primary_keys == ["id"]
     assert parsed.business_keys == ["id"]
     assert parsed.hash_keys == ["created_at"]
+
+
+def test_parse_payload_extracts_required_fields_from_json_schema() -> None:
+    session = FakeSession([])
+    client = ContractRegistryClient(base_url="http://contracts.local", session=session, sleep_func=lambda _: None)  # type: ignore[arg-type]
+
+    parsed = client._parse_payload(
+        {
+            "contract": {"id": "orders-contract", "target_layer": "curated"},
+            "version": {
+                "version": "1.0.0",
+                "checksum": "abc",
+                "schema_json": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "status": {"type": "string"},
+                    },
+                    "required": ["id"],
+                    "x-primaryKey": ["id"],
+                },
+            },
+        }
+    )
+
+    assert parsed.required_fields == ["id"]
 
 
 def test_parse_payload_validates_required_fields() -> None:

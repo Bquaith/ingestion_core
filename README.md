@@ -6,6 +6,8 @@
 - клиент contract registry (`data-contracts-service`)
 - детерминированное хеширование строк
 - engine синхронизации PostgreSQL source/target
+- staged hash-diff pipeline `extract -> validate -> land -> load_raw -> merge_curated`
+- S3/MinIO object store client для landing-зоны
 - аудит запусков и состояние пайплайна
 - unit и integration тесты ядра
 
@@ -86,6 +88,26 @@ result = run_hash_diff(
 )
 
 print(result)
+```
+
+## Staged Hash-Diff Pipeline
+
+Для orchestration через Airflow в пакете есть stage-функции:
+- `extract_source_snapshot`
+- `validate_extracted_snapshot`
+- `land_validated_snapshot`
+- `load_raw_snapshot`
+- `merge_raw_snapshot_to_curated`
+
+Они используются DAG-ом `ingest_contract_hashdiff` в репозитории `ingestion-airflow` и реализуют полный цикл:
+
+```text
+source PostgreSQL
+  -> extract snapshot
+  -> validate against contract
+  -> land accepted batch to MinIO/S3
+  -> load batch into raw PostgreSQL
+  -> merge into curated PostgreSQL
 ```
 
 ## Тесты

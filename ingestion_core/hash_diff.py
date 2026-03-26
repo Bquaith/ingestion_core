@@ -25,8 +25,10 @@ class ContractDefinition:
     target_layer: str
     version: str
     checksum: str
+    schema_json: dict[str, Any]
     fields: list[str]
     field_types: dict[str, str]
+    required_fields: list[str]
     primary_keys: list[str]
     business_keys: list[str]
     hash_keys: list[str]
@@ -52,6 +54,8 @@ class ContractDefinition:
             raise ValueError("version.schema_json.fields must not be empty")
         if not self.key_fields:
             raise ValueError("Contract keys are empty: provide keys.primary or keys.business")
+        if not isinstance(self.schema_json, dict):
+            raise ValueError("version.schema_json must be an object")
 
         missing_keys = [key for key in self.key_fields if key not in self.fields]
         if missing_keys:
@@ -65,6 +69,10 @@ class ContractDefinition:
         if unknown_typed_fields:
             raise ValueError(f"Typed fields are absent in fields: {unknown_typed_fields}")
 
+        unknown_required_fields = [field for field in self.required_fields if field not in self.fields]
+        if unknown_required_fields:
+            raise ValueError(f"Required fields are absent in fields: {unknown_required_fields}")
+
     @classmethod
     def from_registry_payload(cls, payload: Mapping[str, Any]) -> "ContractDefinition":
         contract = cls(
@@ -72,8 +80,10 @@ class ContractDefinition:
             target_layer=str(payload.get("target_layer", "")),
             version=str(payload.get("version", "")),
             checksum=str(payload.get("checksum", "")),
+            schema_json=dict(payload.get("schema_json") or {}),
             fields=[str(v) for v in (payload.get("fields") or [])],
             field_types={str(k): str(v) for k, v in dict(payload.get("field_types") or {}).items()},
+            required_fields=[str(v) for v in (payload.get("required_fields") or [])],
             primary_keys=[str(v) for v in (payload.get("primary_keys") or [])],
             business_keys=[str(v) for v in (payload.get("business_keys") or [])],
             hash_keys=[str(v) for v in (payload.get("hash_keys") or [])],
@@ -272,6 +282,9 @@ def _validate_source_columns(
 
         source_column = source_table.c[field]
         actual_type = _normalize_sqlalchemy_type(source_column.type)
+        if expected_type == "array" and actual_type == "json":
+            # Arrays persisted as JSON/JSONB preserve snapshot semantics and stay hash-stable.
+            continue
         if actual_type != expected_type:
             mismatches.append(
                 f"{field}: expected {expected_type} ({expected_raw}), "
@@ -416,8 +429,14 @@ def _iter_source_row_batches(
     fields: Sequence[str],
     key_fields: Sequence[str],
     source_batch_size: int,
+    extra_fields: Sequence[str] | None = None,
 ) -> Iterable[tuple[list[dict[str, Any]], float]]:
-    query = select(*(source_table.c[field] for field in fields))
+    selected_fields = list(fields)
+    for extra_field in extra_fields or ():
+        if extra_field not in selected_fields:
+            selected_fields.append(extra_field)
+
+    query = select(*(source_table.c[field] for field in selected_fields))
     if key_fields:
         query = query.order_by(*(source_table.c[field] for field in key_fields))
 
@@ -433,7 +452,7 @@ def _iter_source_row_batches(
 
             normalized: list[dict[str, Any]] = []
             for row in rows:
-                normalized.append({field: row[field] for field in fields})
+                normalized.append({field: row[field] for field in selected_fields})
             yield normalized, fetch_seconds
 
 
@@ -442,6 +461,22 @@ def _add_row_hashes(rows: Sequence[Mapping[str, Any]], hash_fields: Sequence[str
     for row in rows:
         row_dict = dict(row)
         row_dict["row_hash"] = calculate_row_hash(row_dict, hash_fields)
+        result.append(row_dict)
+    return result
+
+
+def _use_precomputed_row_hashes(
+    rows: Sequence[Mapping[str, Any]],
+    fields: Sequence[str],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        row_hash = row.get("row_hash")
+        if row_hash is None or not str(row_hash).strip():
+            raise ValueError("Source row_hash column must contain non-empty values for all rows")
+
+        row_dict = {field: row[field] for field in fields}
+        row_dict["row_hash"] = str(row_hash)
         result.append(row_dict)
     return result
 
@@ -598,6 +633,7 @@ def run_hash_diff(
             fields=contract.fields,
             field_types=contract.field_types,
         )
+        has_precomputed_row_hash = "row_hash" in source_table_obj.columns.keys()
 
         target_table_obj = _ensure_target_curated_table(
             target_engine=target_engine,
@@ -629,13 +665,20 @@ def run_hash_diff(
                 fields=contract.fields,
                 key_fields=contract.key_fields,
                 source_batch_size=source_batch_size,
+                extra_fields=["row_hash"] if has_precomputed_row_hash else None,
             ):
                 processed_batches += 1
                 read_seconds += fetch_seconds
                 read_count += len(source_batch)
 
                 diff_started = perf_counter()
-                source_rows_with_hashes = _add_row_hashes(source_batch, contract.effective_hash_fields)
+                if has_precomputed_row_hash:
+                    source_rows_with_hashes = _use_precomputed_row_hashes(
+                        source_batch,
+                        contract.fields,
+                    )
+                else:
+                    source_rows_with_hashes = _add_row_hashes(source_batch, contract.effective_hash_fields)
                 batch_keys = [build_row_key(row, contract.key_fields) for row in source_rows_with_hashes]
                 _stage_source_keys(
                     target_engine=target_engine,

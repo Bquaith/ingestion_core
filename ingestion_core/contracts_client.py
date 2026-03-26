@@ -34,8 +34,10 @@ class ContractPayload:
     target_layer: str
     version: str
     checksum: str
+    schema_json: dict[str, Any]
     fields: list[str]
     field_types: dict[str, str]
+    required_fields: list[str]
     primary_keys: list[str]
     business_keys: list[str]
     hash_keys: list[str]
@@ -46,8 +48,10 @@ class ContractPayload:
             "target_layer": self.target_layer,
             "version": self.version,
             "checksum": self.checksum,
+            "schema_json": dict(self.schema_json),
             "fields": self.fields,
             "field_types": self.field_types,
+            "required_fields": self.required_fields,
             "primary_keys": self.primary_keys,
             "business_keys": self.business_keys,
             "hash_keys": self.hash_keys,
@@ -164,6 +168,30 @@ class ContractRegistryClient:
 
         return fields, field_types
 
+    def _extract_required_fields(self, schema_json: dict[str, Any]) -> list[str]:
+        required_fields: list[str] = []
+
+        required_raw = schema_json.get("required")
+        if isinstance(required_raw, list):
+            for item in required_raw:
+                if isinstance(item, str) and item.strip():
+                    required_fields.append(item.strip())
+
+        if required_fields:
+            return list(dict.fromkeys(required_fields))
+
+        fields_raw = schema_json.get("fields")
+        if isinstance(fields_raw, list):
+            for item in fields_raw:
+                if not isinstance(item, dict):
+                    continue
+                field_name = item.get("name")
+                nullable = item.get("nullable")
+                if isinstance(field_name, str) and field_name.strip() and nullable is False:
+                    required_fields.append(field_name.strip())
+
+        return list(dict.fromkeys(required_fields))
+
     def _is_retriable_status(self, status_code: int) -> bool:
         return status_code in self.RETRIABLE_STATUS_CODES
 
@@ -245,6 +273,7 @@ class ContractRegistryClient:
         fields, field_types = self._extract_fields_and_types(schema_json)
         if not fields:
             raise ContractPayloadError("Contract payload must include at least one schema field/property")
+        required_fields = self._extract_required_fields(schema_json)
 
         keys = schema_json.get("keys") if isinstance(schema_json.get("keys"), dict) else {}
 
@@ -267,8 +296,10 @@ class ContractRegistryClient:
             target_layer=self._required_str(contract.get("target_layer"), "contract.target_layer"),
             version=self._required_str(version.get("version"), "version.version"),
             checksum=self._required_str(version.get("checksum"), "version.checksum"),
+            schema_json=dict(schema_json),
             fields=fields,
             field_types=field_types,
+            required_fields=required_fields,
             primary_keys=primary_keys,
             business_keys=business_keys,
             hash_keys=hash_keys,

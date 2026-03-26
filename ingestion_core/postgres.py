@@ -4,6 +4,7 @@ import re
 
 from sqlalchemy import MetaData, Table, create_engine, inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import NoSuchTableError
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -43,4 +44,10 @@ def reflect_table(engine: Engine, schema: str, name: str) -> Table:
     safe_schema = validate_identifier(schema)
     safe_name = validate_identifier(name)
     metadata = MetaData()
-    return Table(safe_name, metadata, schema=safe_schema, autoload_with=engine)
+    try:
+        return Table(safe_name, metadata, schema=safe_schema, autoload_with=engine)
+    except NoSuchTableError as exc:
+        qualified_name = f"{safe_schema}.{safe_name}"
+        raise NoSuchTableError(
+            f"{qualified_name} not found; check source_table, schema, database, and exact identifier case"
+        ) from exc
