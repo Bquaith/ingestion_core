@@ -142,23 +142,6 @@ class ContractRegistryClient:
         fields: list[str] = []
         field_types: dict[str, str] = {}
 
-        fields_raw = schema_json.get("fields") if isinstance(schema_json.get("fields"), list) else []
-        for item in fields_raw:
-            if isinstance(item, str):
-                fields.append(item)
-                continue
-            if isinstance(item, dict) and item.get("name"):
-                field_name = str(item["name"])
-                fields.append(field_name)
-                raw_type = item.get("type")
-                if raw_type is not None:
-                    normalized_type = str(raw_type).strip()
-                    if normalized_type:
-                        field_types[field_name] = normalized_type
-
-        if fields:
-            return fields, field_types
-
         properties = schema_json.get("properties") if isinstance(schema_json.get("properties"), dict) else {}
         for field_name, property_schema in properties.items():
             if not isinstance(field_name, str) or not field_name.strip():
@@ -180,19 +163,6 @@ class ContractRegistryClient:
             for item in required_raw:
                 if isinstance(item, str) and item.strip():
                     required_fields.append(item.strip())
-
-        if required_fields:
-            return list(dict.fromkeys(required_fields))
-
-        fields_raw = schema_json.get("fields")
-        if isinstance(fields_raw, list):
-            for item in fields_raw:
-                if not isinstance(item, dict):
-                    continue
-                field_name = item.get("name")
-                nullable = item.get("nullable")
-                if isinstance(field_name, str) and field_name.strip() and nullable is False:
-                    required_fields.append(field_name.strip())
 
         return list(dict.fromkeys(required_fields))
 
@@ -278,33 +248,23 @@ class ContractRegistryClient:
         if not isinstance(version, dict):
             raise ContractPayloadError("Contract payload must include version object")
 
-        schema_json = version.get("schema_json") if isinstance(version.get("schema_json"), dict) else {}
-        if not schema_json and isinstance(data.get("schema"), dict):
-            # Compatibility fallback for simplified contract shape.
-            schema_json = data.get("schema")  # type: ignore[assignment]
+        schema_json = version.get("schema_json")
         if not isinstance(schema_json, dict):
             raise ContractPayloadError("Contract payload must include schema_json object")
+        if schema_json.get("type") != "object":
+            raise ContractPayloadError("Contract payload schema_json must declare type='object'")
+        properties = schema_json.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            raise ContractPayloadError("Contract payload schema_json must include non-empty properties object")
 
         fields, field_types = self._extract_fields_and_types(schema_json)
         if not fields:
             raise ContractPayloadError("Contract payload must include at least one schema field/property")
         required_fields = self._extract_required_fields(schema_json)
 
-        keys = schema_json.get("keys") if isinstance(schema_json.get("keys"), dict) else {}
-
-        primary_keys = [str(v) for v in (keys.get("primary") or [])]
-        if not primary_keys:
-            primary_keys = [str(v) for v in (schema_json.get("primary_key") or [])]
-        if not primary_keys:
-            primary_keys = [str(v) for v in (schema_json.get("x-primaryKey") or [])]
-        business_keys = [str(v) for v in (keys.get("business") or [])]
-        if not business_keys:
-            business_keys = [str(v) for v in (schema_json.get("x-businessKey") or [])]
-        hash_keys = [str(v) for v in (keys.get("hash_keys") or [])]
-        if not hash_keys:
-            hash_keys = [str(v) for v in (schema_json.get("x-hashKey") or [])]
-        if not hash_keys:
-            hash_keys = [str(v) for v in (schema_json.get("x-hashKeys") or [])]
+        primary_keys = [str(v) for v in (schema_json.get("x-primaryKey") or [])]
+        business_keys = [str(v) for v in (schema_json.get("x-businessKey") or [])]
+        hash_keys = [str(v) for v in (schema_json.get("x-hashKeys") or [])]
 
         return ContractPayload(
             contract_id=self._required_str(contract.get("id"), "contract.id"),

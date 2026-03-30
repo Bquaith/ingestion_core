@@ -60,27 +60,6 @@ def _contract_payload_json_schema() -> dict[str, Any]:
     }
 
 
-def _contract_payload_legacy() -> dict[str, Any]:
-    return {
-        "contract": {"id": "orders-contract", "target_layer": "curated"},
-        "version": {
-            "version": "1",
-            "checksum": "abc123",
-            "schema_json": {
-                "fields": [
-                    {"name": "id", "type": "bigint"},
-                    {"name": "status", "type": "string"},
-                ],
-                "keys": {
-                    "primary": ["id"],
-                    "business": [],
-                    "hash_keys": ["status"],
-                },
-            },
-        },
-    }
-
-
 def test_fetch_contract_retries_on_transient_status() -> None:
     session = FakeSession(
         [
@@ -147,20 +126,6 @@ def test_fetch_contract_does_not_retry_on_not_found() -> None:
 
     assert exc_info.value.status_code == 404
     assert len(session.calls) == 1
-
-
-def test_parse_payload_supports_legacy_schema_shape() -> None:
-    session = FakeSession([])
-    client = ContractRegistryClient(base_url="http://contracts.local", session=session, sleep_func=lambda _: None)  # type: ignore[arg-type]
-
-    parsed = client._parse_payload(_contract_payload_legacy())
-
-    assert parsed.schema_json["fields"][0]["name"] == "id"
-    assert parsed.fields == ["id", "status"]
-    assert parsed.field_types == {"id": "bigint", "status": "string"}
-    assert parsed.required_fields == []
-    assert parsed.primary_keys == ["id"]
-    assert parsed.hash_keys == ["status"]
 
 
 def test_parse_payload_extracts_types_and_extensions_from_json_schema() -> None:
@@ -279,6 +244,26 @@ def test_parse_payload_validates_required_fields() -> None:
                     "schema_json": {
                         "type": "object",
                         "properties": {"id": {"type": "integer"}},
+                        "x-primaryKey": ["id"],
+                    },
+                },
+            }
+        )
+
+
+def test_parse_payload_requires_json_schema_object_properties() -> None:
+    session = FakeSession([])
+    client = ContractRegistryClient(base_url="http://contracts.local", session=session, sleep_func=lambda _: None)  # type: ignore[arg-type]
+
+    with pytest.raises(ContractPayloadError, match="non-empty properties object"):
+        client._parse_payload(
+            {
+                "contract": {"id": "orders-contract", "target_layer": "curated"},
+                "version": {
+                    "version": "1",
+                    "checksum": "abc",
+                    "schema_json": {
+                        "type": "object",
                         "x-primaryKey": ["id"],
                     },
                 },
