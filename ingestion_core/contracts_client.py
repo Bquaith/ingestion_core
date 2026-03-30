@@ -68,6 +68,8 @@ class ContractRegistryClient:
         max_retries: int = 3,
         retry_backoff_seconds: float = 0.5,
         max_backoff_seconds: float = 8.0,
+        access_token: str | None = None,
+        token_provider: Callable[[], str] | None = None,
         session: requests.Session | None = None,
         sleep_func: Callable[[float], None] | None = None,
     ) -> None:
@@ -76,6 +78,8 @@ class ContractRegistryClient:
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
         self.max_backoff_seconds = max_backoff_seconds
+        self.access_token = access_token
+        self.token_provider = token_provider
         self.session = session or requests.Session()
         self.sleep_func = sleep_func or time.sleep
 
@@ -199,6 +203,17 @@ class ContractRegistryClient:
         backoff = min(self.retry_backoff_seconds * (2 ** (attempt - 1)), self.max_backoff_seconds)
         self.sleep_func(backoff)
 
+    def _request_headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+
+        token = self.access_token
+        if token is None and self.token_provider is not None:
+            token = self.token_provider()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        return headers
+
     def _get_json_with_retry(self, endpoint: str) -> dict[str, Any]:
         url = f"{self.base_url}{endpoint}"
         total_attempts = self.max_retries + 1
@@ -208,7 +223,7 @@ class ContractRegistryClient:
                 response = self.session.get(
                     url,
                     timeout=self.timeout_seconds,
-                    headers={"Accept": "application/json"},
+                    headers=self._request_headers(),
                 )
             except (requests.Timeout, requests.ConnectionError) as exc:
                 if attempt == total_attempts:

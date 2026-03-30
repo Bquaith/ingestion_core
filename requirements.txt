@@ -1,7 +1,7 @@
 # Runtime dependencies for ingestion-platform Python package
 # Airflow is intentionally excluded from this environment because
-# apache-airflow==2.10.4 requires SQLAlchemy<2.0, while this package uses SQLAlchemy 2.x.
-requests==2.32.3
-boto3==1.36.26
+# Apache Airflow keeps SQLAlchemy<2.0 in its runtime, while this package uses SQLAlchemy 2.x.
+requests==2.32.5
+boto3==1.39.11
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10

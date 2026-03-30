@@ -82,6 +82,19 @@ class ObjectStoreClient:
         )
         return normalized_key
 
+    def get_json(self, key: str) -> dict[str, Any]:
+        normalized_key = self.config.normalize_key(key)
+        response = self._client.get_object(Bucket=self.config.bucket, Key=normalized_key)
+        body = response["Body"]
+        try:
+            payload = json.loads(body.read().decode("utf-8"))
+        finally:
+            body.close()
+
+        if not isinstance(payload, dict):
+            raise ValueError(f"Object store JSON payload must be an object for key: {normalized_key}")
+        return payload
+
     def copy_object(self, source_key: str, destination_key: str) -> str:
         normalized_source_key = self.config.normalize_key(source_key)
         normalized_destination_key = self.config.normalize_key(destination_key)

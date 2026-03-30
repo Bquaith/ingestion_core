@@ -69,27 +69,6 @@ make install-dev
 }
 ```
 
-## Пример использования
-
-```python
-from ingestion_core.contracts_client import ContractRegistryClient
-from ingestion_core.hash_diff import ContractDefinition, run_hash_diff
-
-client = ContractRegistryClient("http://contracts.local")
-payload = client.fetch_contract(namespace="sales", name="orders")
-contract = ContractDefinition.from_registry_payload(payload.to_dict())
-
-result = run_hash_diff(
-    source_dsn="postgresql+psycopg2://source_user:source_pass@localhost:5433/source_db",
-    source_table="public.orders",
-    target_dsn="postgresql+psycopg2://target_user:target_pass@localhost:5434/target_db",
-    target_table_curated="curated.orders",
-    contract=contract,
-)
-
-print(result)
-```
-
 ## Staged Hash-Diff Pipeline
 
 Для orchestration через Airflow в пакете есть stage-функции:
@@ -106,6 +85,16 @@ source PostgreSQL
   -> extract snapshot
   -> validate against contract
   -> land accepted batch to MinIO/S3
+  -> load batch into raw PostgreSQL
+  -> merge into curated PostgreSQL
+```
+
+Для повторной загрузки от уже сохраненного `accepted_snapshot` в репозитории
+`ingestion-airflow` реализован отдельный DAG `replay_contract_hashdiff_from_minio`.
+Replay использует только шаги:
+
+```text
+accepted snapshot in MinIO/S3
   -> load batch into raw PostgreSQL
   -> merge into curated PostgreSQL
 ```

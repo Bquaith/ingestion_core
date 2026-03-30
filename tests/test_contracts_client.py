@@ -228,6 +228,43 @@ def test_parse_payload_extracts_required_fields_from_json_schema() -> None:
     assert parsed.required_fields == ["id"]
 
 
+def test_fetch_contract_sends_bearer_token_header() -> None:
+    session = FakeSession([FakeResponse(status_code=200, payload=_contract_payload_json_schema(), text="ok")])
+    client = ContractRegistryClient(
+        base_url="http://contracts.local",
+        access_token="test-access-token",
+        session=session,  # type: ignore[arg-type]
+        sleep_func=lambda _: None,
+    )
+
+    payload = client.fetch_contract(namespace="sales", name="orders")
+
+    assert payload.contract_id == "orders-contract"
+    assert session.calls[0]["headers"]["Authorization"] == "Bearer test-access-token"
+
+
+def test_fetch_contract_uses_token_provider_when_configured() -> None:
+    session = FakeSession([FakeResponse(status_code=200, payload=_contract_payload_json_schema(), text="ok")])
+    calls: list[str] = []
+
+    def _provide_token() -> str:
+        calls.append("called")
+        return "dynamic-token"
+
+    client = ContractRegistryClient(
+        base_url="http://contracts.local",
+        token_provider=_provide_token,
+        session=session,  # type: ignore[arg-type]
+        sleep_func=lambda _: None,
+    )
+
+    payload = client.fetch_contract(namespace="sales", name="orders")
+
+    assert payload.contract_id == "orders-contract"
+    assert calls == ["called"]
+    assert session.calls[0]["headers"]["Authorization"] == "Bearer dynamic-token"
+
+
 def test_parse_payload_validates_required_fields() -> None:
     session = FakeSession([])
     client = ContractRegistryClient(base_url="http://contracts.local", session=session, sleep_func=lambda _: None)  # type: ignore[arg-type]
