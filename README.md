@@ -6,7 +6,7 @@
 - клиент contract registry (`data-contracts-service`)
 - детерминированное хеширование строк
 - engine синхронизации PostgreSQL source/target
-- staged hash-diff pipeline `extract -> validate -> land -> load_raw -> merge_curated`
+- staged hash-diff pipeline `extract_validate_land -> merge_curated`
 - S3/MinIO object store client для landing-зоны
 - аудит запусков и состояние пайплайна
 - unit и integration тесты ядра
@@ -72,20 +72,16 @@ make install-dev
 ## Staged Hash-Diff Pipeline
 
 Для orchestration через Airflow в пакете есть stage-функции:
-- `extract_source_snapshot`
-- `validate_extracted_snapshot`
-- `land_validated_snapshot`
-- `load_raw_snapshot`
-- `merge_raw_snapshot_to_curated`
+- `extract_validate_land_snapshot`
+- `merge_accepted_snapshot_to_curated`
 
 Они используются DAG-ом `ingest_contract_hashdiff` в репозитории `ingestion-airflow` и реализуют полный цикл:
 
 ```text
 source PostgreSQL
-  -> extract snapshot
-  -> validate against contract
-  -> land accepted batch to MinIO/S3
-  -> load batch into raw PostgreSQL
+  -> extract + validate against contract
+  -> land accepted snapshot to MinIO/S3
+  -> load accepted snapshot into short-lived merge staging table
   -> merge into curated PostgreSQL
 ```
 
@@ -95,7 +91,7 @@ Replay использует только шаги:
 
 ```text
 accepted snapshot in MinIO/S3
-  -> load batch into raw PostgreSQL
+  -> load accepted snapshot into short-lived merge staging table
   -> merge into curated PostgreSQL
 ```
 
