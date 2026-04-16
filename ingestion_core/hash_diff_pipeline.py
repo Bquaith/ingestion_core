@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
-from decimal import Decimal, InvalidOperation
 import gzip
 import json
 import logging
@@ -12,26 +9,28 @@ from tempfile import NamedTemporaryFile
 import uuid
 from typing import Any, Mapping
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, LargeBinary, MetaData, Numeric, PrimaryKeyConstraint, Table, Text, Time
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text
 
-from ingestion_core.contract_schema_validation import validate_instance_against_schema
+from ingestion_core.contract_runtime import (
+    ContractValidationError,
+    build_contract_row_payload as _build_contract_row_payload,
+    coerce_contract_value as _coerce_contract_value,
+    contract_field_nullable as _contract_field_nullable,
+    normalize_contract_row as _normalize_contract_row,
+    sqlalchemy_type_from_contract_field as _sqlalchemy_type_from_contract_field,
+    summarize_validation_errors as _summarize_validation_errors,
+)
+from ingestion_core.contract_types import ContractDefinition
 from ingestion_core.hash_diff import (
-    ContractDefinition,
     HashDiffResult,
     _iter_source_row_batches,
     _validate_source_columns,
     run_hash_diff,
 )
-from ingestion_core.hashing import calculate_row_hash
 from ingestion_core.object_store import ObjectStoreClient, ObjectStoreConfig
 from ingestion_core.postgres import create_sqlalchemy_engine, ensure_schema, parse_table_name, reflect_table
 
 logger = logging.getLogger(__name__)
-
-
-class ContractValidationError(RuntimeError):
-    """Raised when extracted rows do not satisfy the active contract."""
 
 
 _VALIDATION_ERROR_PREVIEW_LIMIT = 5
@@ -59,259 +58,6 @@ class ExtractValidateLandResult:
             "processed_batches": self.processed_batches,
             "source_read_seconds": self.source_read_seconds,
         }
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, time):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return format(value, "f")
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return base64.b64encode(bytes(value)).decode("ascii")
-    raise TypeError(f"Unsupported value for JSON serialization: {type(value)!r}")
-
-
-def _normalize_json_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _normalize_json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_json_value(item) for item in value]
-    if isinstance(value, (datetime, date, time, Decimal, bytes, bytearray, memoryview)):
-        return _json_default(value)
-    return value
-
-
-def _parse_iso_datetime(value: str) -> datetime:
-    trimmed = value.strip()
-    if trimmed.endswith("Z"):
-        trimmed = f"{trimmed[:-1]}+00:00"
-    return datetime.fromisoformat(trimmed)
-
-
-def _coerce_contract_value(value: Any, field_type: str | None) -> Any:
-    if value is None:
-        return None
-
-    normalized_type = (field_type or "").strip().lower()
-    if normalized_type in {"", "unknown"}:
-        return value
-    if normalized_type.startswith("array"):
-        if isinstance(value, list):
-            return value
-        if isinstance(value, tuple):
-            return list(value)
-        raise ValueError("expected array value")
-    if normalized_type in {"string", "text", "char", "varchar", "character varying"}:
-        return str(value)
-    if normalized_type == "uuid":
-        return str(value)
-    if normalized_type in {"integer", "int", "bigint", "smallint", "serial", "bigserial"}:
-        if isinstance(value, bool):
-            raise ValueError("boolean is not a valid integer")
-        return int(value)
-    if normalized_type in {
-        "decimal",
-        "numeric",
-        "number",
-        "double",
-        "double precision",
-        "float",
-        "float4",
-        "float8",
-        "real",
-        "money",
-    }:
-        try:
-            return Decimal(str(value))
-        except (InvalidOperation, ValueError) as exc:
-            raise ValueError("expected decimal value") from exc
-    if normalized_type in {"bool", "boolean"}:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"true", "1", "yes", "y"}:
-                return True
-            if lowered in {"false", "0", "no", "n"}:
-                return False
-        raise ValueError("expected boolean value")
-    if normalized_type in {
-        "datetime",
-        "timestamp",
-        "timestampz",
-        "timestamptz",
-        "timestamp without time zone",
-        "timestamp with time zone",
-    }:
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            return _parse_iso_datetime(value)
-        raise ValueError("expected timestamp value")
-    if normalized_type == "date":
-        if isinstance(value, date) and not isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            return date.fromisoformat(value)
-        raise ValueError("expected date value")
-    if normalized_type == "time":
-        if isinstance(value, time):
-            return value
-        if isinstance(value, str):
-            return time.fromisoformat(value)
-        raise ValueError("expected time value")
-    if normalized_type in {"json", "jsonb"}:
-        if isinstance(value, (dict, list)):
-            return value
-        raise ValueError("expected JSON object or array")
-    if normalized_type in {"binary", "bytea", "blob"}:
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            return bytes(value)
-        if isinstance(value, str):
-            try:
-                return base64.b64decode(value.encode("ascii"))
-            except ValueError as exc:
-                raise ValueError("expected base64-encoded binary value") from exc
-        raise ValueError("expected binary value")
-    return value
-
-
-def _contract_field_nullable(contract: ContractDefinition, field_name: str) -> bool:
-    return field_name not in set(contract.required_fields) and field_name not in set(contract.key_fields)
-
-
-def _summarize_validation_errors(errors: list[dict[str, Any]]) -> str:
-    if not errors:
-        return "no validation error details captured"
-
-    chunks: list[str] = []
-    for error in errors:
-        row_number = error.get("row_number", "?")
-        field_name = str(error.get("field", "$"))
-        code = str(error.get("code", "validation_error"))
-        message = str(error.get("message", "validation failed"))
-        chunks.append(f"row {row_number}, field {field_name}, code {code}: {message}")
-    return "; ".join(chunks)
-
-
-def _contract_property_schema(contract: ContractDefinition, field_name: str) -> Mapping[str, Any]:
-    properties = contract.schema_json.get("properties")
-    if not isinstance(properties, Mapping):
-        return {}
-
-    property_schema = properties.get(field_name)
-    if not isinstance(property_schema, Mapping):
-        return {}
-    return property_schema
-
-
-def _contract_schema_type(property_schema: Mapping[str, Any]) -> str | None:
-    raw_type = property_schema.get("type")
-    if isinstance(raw_type, str) and raw_type.strip():
-        return raw_type.strip().lower()
-    if isinstance(raw_type, list):
-        for candidate in raw_type:
-            if isinstance(candidate, str):
-                normalized = candidate.strip().lower()
-                if normalized and normalized != "null":
-                    return normalized
-    return None
-
-
-def _sqlalchemy_type_from_contract_field(contract: ContractDefinition, field_name: str) -> Any:
-    property_schema = _contract_property_schema(contract, field_name)
-    schema_type = _contract_schema_type(property_schema)
-
-    if schema_type == "string":
-        raw_format = property_schema.get("format")
-        if isinstance(raw_format, str):
-            normalized_format = raw_format.strip().lower()
-            if normalized_format == "date-time":
-                return DateTime(timezone=True)
-            if normalized_format == "date":
-                return Date()
-            if normalized_format == "time":
-                return Time()
-            if normalized_format == "uuid":
-                return PGUUID(as_uuid=False)
-            if normalized_format in {"byte", "binary"}:
-                return LargeBinary()
-        return Text()
-    if schema_type == "integer":
-        return Integer()
-    if schema_type == "number":
-        return Numeric()
-    if schema_type == "boolean":
-        return Boolean()
-    if schema_type == "object":
-        return JSONB()
-    if schema_type == "array":
-        return JSONB()
-
-    field_type = contract.field_types.get(field_name)
-    normalized_field_type = (field_type or "").strip().lower()
-    if normalized_field_type.startswith("array"):
-        return JSONB()
-    if normalized_field_type in {"json", "jsonb"}:
-        return JSONB()
-    if normalized_field_type == "uuid":
-        return PGUUID(as_uuid=False)
-    if normalized_field_type in {"bool", "boolean"}:
-        return Boolean()
-    if normalized_field_type == "date":
-        return Date()
-    if normalized_field_type == "time":
-        return Time()
-    if normalized_field_type in {
-        "datetime",
-        "timestamp",
-        "timestampz",
-        "timestamptz",
-        "timestamp without time zone",
-        "timestamp with time zone",
-    }:
-        return DateTime(timezone=True)
-    if normalized_field_type in {
-        "tinyint",
-        "smallint",
-        "int",
-        "integer",
-        "bigint",
-        "serial",
-        "bigserial",
-    }:
-        return Integer()
-    if normalized_field_type in {
-        "decimal",
-        "numeric",
-        "number",
-        "double",
-        "double precision",
-        "float",
-        "float4",
-        "float8",
-        "real",
-        "money",
-    }:
-        return Numeric()
-    if normalized_field_type in {"binary", "bytea", "blob"}:
-        return LargeBinary()
-    if normalized_field_type in {
-        "string",
-        "text",
-        "char",
-        "character",
-        "varchar",
-        "character varying",
-        "citext",
-    }:
-        return Text()
-    return JSONB()
-
 
 def _create_merge_staging_table(
     target_engine,
@@ -416,59 +162,14 @@ def extract_validate_land_snapshot(
 
                 for row in source_batch:
                     source_row_number += 1
-                    row_errors: list[dict[str, Any]] = []
-                    normalized_row: dict[str, Any] = {}
-
-                    for field in contract.fields:
-                        if field not in row:
-                            row_errors.append(
-                                {
-                                    "row_number": source_row_number,
-                                    "field": field,
-                                    "code": "missing_field",
-                                    "message": f"Field '{field}' is absent in extracted row",
-                                }
-                            )
-                            continue
-
-                        raw_value = row[field]
-                        if raw_value is None and field in contract.required_fields:
-                            row_errors.append(
-                                {
-                                    "row_number": source_row_number,
-                                    "field": field,
-                                    "code": "required_field",
-                                    "message": f"Field '{field}' must not be null",
-                                }
-                            )
-                            normalized_row[field] = None
-                            continue
-
-                        try:
-                            normalized_row[field] = _coerce_contract_value(
-                                raw_value,
-                                contract.field_types.get(field),
-                            )
-                        except (TypeError, ValueError) as exc:
-                            row_errors.append(
-                                {
-                                    "row_number": source_row_number,
-                                    "field": field,
-                                    "code": "invalid_value",
-                                    "message": str(exc),
-                                }
-                            )
-
+                    validation_result = _normalize_contract_row(
+                        row=row,
+                        contract=contract,
+                        row_number=source_row_number,
+                    )
+                    row_errors = list(validation_result.errors)
+                    normalized_row = validation_result.normalized_row
                     key_tuple = tuple(normalized_row.get(field) for field in contract.key_fields)
-                    if not row_errors and any(value is None for value in key_tuple):
-                        row_errors.append(
-                            {
-                                "row_number": source_row_number,
-                                "field": ",".join(contract.key_fields),
-                                "code": "null_key",
-                                "message": "Key fields must not contain null values",
-                            }
-                        )
                     if not row_errors and key_tuple in seen_keys:
                         row_errors.append(
                             {
@@ -478,25 +179,6 @@ def extract_validate_land_snapshot(
                                 "message": "Duplicate key detected inside extracted snapshot",
                             }
                         )
-
-                    if not row_errors:
-                        schema_violations = validate_instance_against_schema(contract.schema_json, normalized_row)
-                        for violation in schema_violations:
-                            error_payload = {
-                                "row_number": source_row_number,
-                                "field": violation.field,
-                                "code": violation.code,
-                                "message": violation.message,
-                            }
-                            if violation.constraint is not None:
-                                error_payload["constraint"] = violation.constraint
-                            if violation.actual_value is not None:
-                                error_payload["actual_value"] = violation.actual_value
-                            if violation.contract_title is not None:
-                                error_payload["contract_title"] = violation.contract_title
-                            if violation.contract_description is not None:
-                                error_payload["contract_description"] = violation.contract_description
-                            row_errors.append(error_payload)
 
                     if row_errors:
                         invalid_row_count += 1
@@ -516,18 +198,11 @@ def extract_validate_land_snapshot(
                         continue
 
                     seen_keys.add(key_tuple)
-                    normalized_payload = {
-                        field: _normalize_json_value(normalized_row[field]) for field in contract.fields
-                    }
-                    normalized_payload["row_hash"] = calculate_row_hash(
-                        normalized_row,
-                        contract.effective_hash_fields,
-                    )
+                    normalized_payload = _build_contract_row_payload(normalized_row, contract)
                     accepted_writer.write(
                         json.dumps(
                             normalized_payload,
                             ensure_ascii=True,
-                            default=_json_default,
                         )
                     )
                     accepted_writer.write("\n")

@@ -10,13 +10,17 @@ import pytest
 from sqlalchemy import Date, DateTime, Integer, Text, create_engine, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 
-import ingestion_core.hash_diff_pipeline as hash_diff_pipeline_module
-from ingestion_core.hash_diff import ContractDefinition
-from ingestion_core.hash_diff_pipeline import (
+from ingestion_core.contract_runtime import (
     ContractValidationError,
-    _coerce_contract_value,
-    _sqlalchemy_type_from_contract_field,
-    _summarize_validation_errors,
+    build_contract_row_payload,
+    coerce_contract_value,
+    normalize_contract_row,
+    sqlalchemy_type_from_contract_field,
+    summarize_validation_errors,
+)
+from ingestion_core.contract_types import ContractDefinition
+import ingestion_core.hash_diff_pipeline as hash_diff_pipeline_module
+from ingestion_core.hash_diff_pipeline import (
     extract_validate_land_snapshot,
     merge_accepted_snapshot_to_curated,
 )
@@ -103,8 +107,8 @@ def _read_gzip_ndjson(payload: bytes) -> list[dict[str, object]]:
 
 
 def test_coerce_contract_value_parses_decimal_and_timestamp() -> None:
-    coerced_decimal = _coerce_contract_value("10.50", "decimal")
-    coerced_timestamp = _coerce_contract_value("2025-01-01T10:00:00Z", "timestamp")
+    coerced_decimal = coerce_contract_value("10.50", "decimal")
+    coerced_timestamp = coerce_contract_value("2025-01-01T10:00:00Z", "timestamp")
 
     assert coerced_decimal == Decimal("10.50")
     assert coerced_timestamp == datetime(2025, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
@@ -112,7 +116,7 @@ def test_coerce_contract_value_parses_decimal_and_timestamp() -> None:
 
 def test_coerce_contract_value_rejects_invalid_boolean() -> None:
     with pytest.raises(ValueError, match="expected boolean value"):
-        _coerce_contract_value("maybe", "boolean")
+        coerce_contract_value("maybe", "boolean")
 
 
 def test_object_store_normalize_key_is_idempotent_for_prefixed_keys() -> None:
@@ -122,7 +126,7 @@ def test_object_store_normalize_key_is_idempotent_for_prefixed_keys() -> None:
 
 
 def test_summarize_validation_errors_includes_row_field_code_and_message() -> None:
-    summary = _summarize_validation_errors(
+    summary = summarize_validation_errors(
         [
             {
                 "row_number": 7,
@@ -173,13 +177,50 @@ def test_sqlalchemy_type_from_contract_field_uses_schema_formats_and_json_contai
         }
     )
 
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "id"), PGUUID)
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "created_at"), DateTime)
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "birthday"), Date)
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "amount"), Integer)
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "payload"), JSONB)
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "tags"), JSONB)
-    assert isinstance(_sqlalchemy_type_from_contract_field(contract, "name"), Text)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "id"), PGUUID)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "created_at"), DateTime)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "birthday"), Date)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "amount"), Integer)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "payload"), JSONB)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "tags"), JSONB)
+    assert isinstance(sqlalchemy_type_from_contract_field(contract, "name"), Text)
+
+
+def test_normalize_contract_row_reports_required_field_error() -> None:
+    contract = _build_contract()
+
+    result = normalize_contract_row(
+        row={"id": None, "status": "NEW"},
+        contract=contract,
+        row_number=3,
+    )
+
+    assert result.normalized_row["id"] is None
+    assert result.errors == [
+        {
+            "row_number": 3,
+            "field": "id",
+            "code": "required_field",
+            "message": "Field 'id' must not be null",
+        }
+    ]
+
+
+def test_build_contract_row_payload_normalizes_values_and_adds_row_hash() -> None:
+    contract = _build_contract()
+
+    payload = build_contract_row_payload(
+        normalized_row={
+            "id": 1,
+            "status": "NEW",
+        },
+        contract=contract,
+    )
+
+    assert payload["id"] == 1
+    assert payload["status"] == "NEW"
+    assert isinstance(payload["row_hash"], str)
+    assert payload["row_hash"]
 
 
 def test_extract_validate_land_snapshot_writes_only_accepted_and_error_artifacts(
