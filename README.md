@@ -13,6 +13,19 @@
 
 Airflow orchestration и Docker runtime вынесены в отдельный репозиторий `ingestion-airflow`.
 
+## Структура пакета
+
+Код разнесен по зонам ответственности:
+
+- `ingestion_core.contracts`:
+  модель контракта, runtime-нормализация и валидация строк, client для contract registry
+- `ingestion_core.strategies.hash_diff`:
+  snapshot/hash-diff engine и pipeline-функции
+- `ingestion_core.adapters`:
+  интеграции с PostgreSQL, S3/MinIO и OIDC/STS
+- `ingestion_core.utils`:
+  низкоуровневые утилиты, например детерминированное хеширование
+
 
 ## Установка
 

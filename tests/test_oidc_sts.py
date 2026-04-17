@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from ingestion_core.oidc_sts import (
+from ingestion_core.adapters.oidc_sts import (
     OIDCClientCredentialsConfig,
     OIDCSTSExchangeError,
     WebIdentitySTSConfig,

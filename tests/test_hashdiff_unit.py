@@ -4,8 +4,8 @@ import pytest
 from sqlalchemy import Column, MetaData, Numeric, String, Table
 from sqlalchemy.dialects.postgresql import JSONB
 
-from ingestion_core.hash_diff import (
-    ContractDefinition,
+from ingestion_core.contracts.types import ContractDefinition
+from ingestion_core.strategies.hash_diff.engine import (
     _validate_source_columns,
     classify_changes,
     run_hash_diff,

@@ -9,9 +9,9 @@ from typing import Any, Mapping
 from sqlalchemy import Boolean, Date, DateTime, Integer, LargeBinary, Numeric, Text, Time
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 
-from ingestion_core.contract_schema_validation import validate_instance_against_schema
-from ingestion_core.contract_types import ContractDefinition
-from ingestion_core.hashing import calculate_row_hash
+from ingestion_core.contracts.schema_validation import validate_instance_against_schema
+from ingestion_core.contracts.types import ContractDefinition
+from ingestion_core.utils.hashing import calculate_row_hash
 
 
 class ContractValidationError(RuntimeError):

@@ -11,7 +11,9 @@ from typing import Any, Mapping
 
 from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text
 
-from ingestion_core.contract_runtime import (
+from ingestion_core.adapters.object_store import ObjectStoreClient, ObjectStoreConfig
+from ingestion_core.adapters.postgres import create_sqlalchemy_engine, ensure_schema, parse_table_name, reflect_table
+from ingestion_core.contracts.runtime import (
     ContractValidationError,
     build_contract_row_payload as _build_contract_row_payload,
     coerce_contract_value as _coerce_contract_value,
@@ -20,15 +22,13 @@ from ingestion_core.contract_runtime import (
     sqlalchemy_type_from_contract_field as _sqlalchemy_type_from_contract_field,
     summarize_validation_errors as _summarize_validation_errors,
 )
-from ingestion_core.contract_types import ContractDefinition
-from ingestion_core.hash_diff import (
+from ingestion_core.contracts.types import ContractDefinition
+from ingestion_core.strategies.hash_diff.engine import (
     HashDiffResult,
     _iter_source_row_batches,
     _validate_source_columns,
     run_hash_diff,
 )
-from ingestion_core.object_store import ObjectStoreClient, ObjectStoreConfig
-from ingestion_core.postgres import create_sqlalchemy_engine, ensure_schema, parse_table_name, reflect_table
 
 logger = logging.getLogger(__name__)
 

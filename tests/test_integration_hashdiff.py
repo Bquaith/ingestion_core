@@ -6,8 +6,9 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from ingestion_core.hash_diff import ContractDefinition, _make_hash_state_table_name, run_hash_diff
-from ingestion_core.postgres import create_sqlalchemy_engine
+from ingestion_core.adapters.postgres import create_sqlalchemy_engine
+from ingestion_core.contracts.types import ContractDefinition
+from ingestion_core.strategies.hash_diff.engine import _make_hash_state_table_name, run_hash_diff
 
 TEST_SOURCE_DSN = os.getenv("TEST_SOURCE_DSN")
 TEST_TARGET_DSN = os.getenv("TEST_TARGET_DSN")

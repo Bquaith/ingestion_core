@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from ingestion_core.contract_schema_validation import validate_instance_against_schema
+from ingestion_core.contracts.schema_validation import validate_instance_against_schema
 
 
 def test_validate_instance_against_schema_accepts_valid_nested_payload() -> None:

@@ -10,7 +10,8 @@ import pytest
 from sqlalchemy import Date, DateTime, Integer, Text, create_engine, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 
-from ingestion_core.contract_runtime import (
+from ingestion_core.adapters.object_store import ObjectStoreConfig
+from ingestion_core.contracts.runtime import (
     ContractValidationError,
     build_contract_row_payload,
     coerce_contract_value,
@@ -18,13 +19,12 @@ from ingestion_core.contract_runtime import (
     sqlalchemy_type_from_contract_field,
     summarize_validation_errors,
 )
-from ingestion_core.contract_types import ContractDefinition
-import ingestion_core.hash_diff_pipeline as hash_diff_pipeline_module
-from ingestion_core.hash_diff_pipeline import (
+from ingestion_core.contracts.types import ContractDefinition
+import ingestion_core.strategies.hash_diff.pipeline as hash_diff_pipeline_module
+from ingestion_core.strategies.hash_diff.pipeline import (
     extract_validate_land_snapshot,
     merge_accepted_snapshot_to_curated,
 )
-from ingestion_core.object_store import ObjectStoreConfig
 
 
 class DummyEngine:
