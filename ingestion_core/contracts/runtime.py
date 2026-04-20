@@ -336,6 +336,60 @@ def normalize_contract_row(
     )
 
 
+def normalize_contract_key_row(
+    row: Mapping[str, Any],
+    contract: ContractDefinition,
+    row_number: int,
+) -> ContractRowValidationResult:
+    errors: list[dict[str, Any]] = []
+    normalized_row: dict[str, Any] = {}
+
+    for field in contract.key_fields:
+        if field not in row:
+            errors.append(
+                _build_validation_error(
+                    row_number=row_number,
+                    field=field,
+                    code="missing_field",
+                    message=f"Key field '{field}' is absent in extracted row",
+                )
+            )
+            continue
+
+        raw_value = row[field]
+        if raw_value is None:
+            errors.append(
+                _build_validation_error(
+                    row_number=row_number,
+                    field=field,
+                    code="null_key",
+                    message=f"Key field '{field}' must not be null",
+                )
+            )
+            normalized_row[field] = None
+            continue
+
+        try:
+            normalized_row[field] = coerce_contract_value(
+                raw_value,
+                contract.field_types.get(field),
+            )
+        except (TypeError, ValueError) as exc:
+            errors.append(
+                _build_validation_error(
+                    row_number=row_number,
+                    field=field,
+                    code="invalid_value",
+                    message=str(exc),
+                )
+            )
+
+    return ContractRowValidationResult(
+        normalized_row=normalized_row,
+        errors=errors,
+    )
+
+
 def build_contract_row_payload(
     normalized_row: Mapping[str, Any],
     contract: ContractDefinition,
@@ -349,6 +403,16 @@ def build_contract_row_payload(
         contract.effective_hash_fields,
     )
     return payload
+
+
+def build_contract_key_payload(
+    normalized_key_row: Mapping[str, Any],
+    contract: ContractDefinition,
+) -> dict[str, Any]:
+    return {
+        field: normalize_json_value(normalized_key_row[field])
+        for field in contract.key_fields
+    }
 
 
 def _build_validation_error(

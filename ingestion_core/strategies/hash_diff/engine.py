@@ -6,8 +6,6 @@ from time import perf_counter
 from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, Table, Text, and_, exists, select, tuple_
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.sql.sqltypes import Boolean, Date, DateTime, Integer, JSON, LargeBinary, Numeric, String, Time
 
 from ingestion_core.adapters.postgres import (
     create_sqlalchemy_engine,
@@ -17,6 +15,22 @@ from ingestion_core.adapters.postgres import (
     table_exists,
 )
 from ingestion_core.contracts.types import ContractDefinition
+from ingestion_core.strategies.common.change_detection import (
+    build_row_key,
+    chunk_rows as _chunk_rows,
+    classify_changes,
+    read_existing_hashes_for_keys as _read_existing_hashes_for_keys,
+)
+from ingestion_core.strategies.common.source import (
+    normalize_contract_type as _normalize_contract_type,
+    normalize_sqlalchemy_type as _normalize_sqlalchemy_type,
+    validate_source_columns as _validate_source_columns,
+)
+from ingestion_core.strategies.common.target import (
+    ensure_hash_state_table as _ensure_hash_state_table,
+    make_hash_state_table_name as _make_hash_state_table_name,
+    upsert_changed_rows as _upsert_changed_rows,
+)
 from ingestion_core.utils.hashing import calculate_row_hash
 
 @dataclass(frozen=True)
@@ -41,193 +55,6 @@ class HashDiffResult:
             "total_seconds": self.total_seconds,
             "delete_count": self.delete_count,
         }
-
-
-def build_row_key(row: Mapping[str, Any], key_fields: Sequence[str]) -> tuple[Any, ...]:
-    return tuple(row[field] for field in key_fields)
-
-
-def classify_changes(
-    source_rows: Sequence[Mapping[str, Any]],
-    existing_hashes: Mapping[tuple[Any, ...], str],
-    key_fields: Sequence[str],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
-    inserts: list[dict[str, Any]] = []
-    updates: list[dict[str, Any]] = []
-    unchanged_count = 0
-
-    for row in source_rows:
-        row_dict = dict(row)
-        key = build_row_key(row_dict, key_fields)
-
-        current_hash = row_dict["row_hash"]
-        previous_hash = existing_hashes.get(key)
-
-        if previous_hash is None:
-            inserts.append(row_dict)
-            continue
-        if previous_hash != current_hash:
-            updates.append(row_dict)
-            continue
-        unchanged_count += 1
-
-    return inserts, updates, unchanged_count
-
-
-def _normalize_contract_type(contract_type: str) -> str:
-    normalized = contract_type.strip().lower()
-    if normalized.startswith("array"):
-        return "array"
-    if normalized in {"uuid"}:
-        return "uuid"
-    if normalized in {"bool", "boolean"}:
-        return "boolean"
-    if normalized in {"date"}:
-        return "date"
-    if normalized in {"time"}:
-        return "time"
-    if normalized in {
-        "datetime",
-        "timestamp",
-        "timestampz",
-        "timestamptz",
-        "timestamp without time zone",
-        "timestamp with time zone",
-    }:
-        return "timestamp"
-    if normalized in {
-        "decimal",
-        "numeric",
-        "number",
-        "double",
-        "double precision",
-        "float",
-        "float4",
-        "float8",
-        "real",
-        "money",
-    }:
-        return "decimal"
-    if normalized in {
-        "tinyint",
-        "smallint",
-        "int",
-        "integer",
-        "bigint",
-        "serial",
-        "bigserial",
-    }:
-        return "integer"
-    if normalized in {
-        "string",
-        "text",
-        "char",
-        "character",
-        "varchar",
-        "character varying",
-        "citext",
-    }:
-        return "string"
-    if normalized in {"json", "jsonb"}:
-        return "json"
-    if normalized in {"binary", "bytea", "blob"}:
-        return "binary"
-    return "unknown"
-
-
-def _normalize_sqlalchemy_type(column_type: Any) -> str:
-    if isinstance(column_type, Boolean):
-        return "boolean"
-    if isinstance(column_type, DateTime):
-        return "timestamp"
-    if isinstance(column_type, Date):
-        return "date"
-    if isinstance(column_type, Time):
-        return "time"
-    if isinstance(column_type, Numeric):
-        return "decimal"
-    if isinstance(column_type, Integer):
-        return "integer"
-    if isinstance(column_type, String):
-        return "string"
-    if isinstance(column_type, JSON):
-        return "json"
-    if isinstance(column_type, LargeBinary):
-        return "binary"
-
-    type_name = str(column_type).lower()
-    if "uuid" in type_name:
-        return "uuid"
-    if "timestamp" in type_name:
-        return "timestamp"
-    if type_name.startswith("date"):
-        return "date"
-    if type_name.startswith("time"):
-        return "time"
-    if "bool" in type_name:
-        return "boolean"
-    if any(token in type_name for token in ("numeric", "decimal", "float", "double", "real", "money")):
-        return "decimal"
-    if any(token in type_name for token in ("int", "serial")):
-        return "integer"
-    if any(token in type_name for token in ("char", "text", "string", "citext")):
-        return "string"
-    if "json" in type_name:
-        return "json"
-    if any(token in type_name for token in ("bytea", "blob", "binary")):
-        return "binary"
-    if "array" in type_name:
-        return "array"
-    return "unknown"
-
-
-def _validate_source_columns(
-    source_table: Table,
-    fields: Sequence[str],
-    field_types: Mapping[str, str] | None = None,
-) -> None:
-    available = set(source_table.columns.keys())
-    missing = [field for field in fields if field not in available]
-    if missing:
-        raise ValueError(f"Source table is missing required contract fields: {missing}")
-
-    if not field_types:
-        return
-
-    mismatches: list[str] = []
-    for field in fields:
-        expected_raw = field_types.get(field)
-        if not expected_raw:
-            continue
-
-        expected_type = _normalize_contract_type(expected_raw)
-        if expected_type == "unknown":
-            mismatches.append(
-                f'{field}: unsupported contract type "{expected_raw}"'
-            )
-            continue
-
-        source_column = source_table.c[field]
-        actual_type = _normalize_sqlalchemy_type(source_column.type)
-        if expected_type == "array" and actual_type == "json":
-            # Arrays persisted as JSON/JSONB preserve snapshot semantics and stay hash-stable.
-            continue
-        if actual_type != expected_type:
-            mismatches.append(
-                f"{field}: expected {expected_type} ({expected_raw}), "
-                f"got {actual_type} ({source_column.type})"
-            )
-
-    if mismatches:
-        raise ValueError(
-            "Source column type mismatch against contract: "
-            + "; ".join(mismatches)
-        )
-
-
-def _make_hash_state_table_name(target_table_name: str) -> str:
-    return f"_hd_state_{target_table_name}"[:63]
-
 
 def _ensure_target_curated_table(
     target_engine,
@@ -264,44 +91,6 @@ def _ensure_target_curated_table(
         raise ValueError(f"Target table is missing required columns: {sorted(missing_columns)}")
 
     return target_table
-
-
-def _ensure_hash_state_table(
-    target_engine,
-    target_schema: str,
-    target_table_name: str,
-    target_table: Table,
-    key_fields: Sequence[str],
-) -> Table:
-    hash_state_table_name = _make_hash_state_table_name(target_table_name)
-
-    if not table_exists(target_engine, target_schema, hash_state_table_name):
-        metadata = MetaData()
-        columns = [
-            Column(field, target_table.c[field].type, nullable=target_table.c[field].nullable)
-            for field in key_fields
-        ]
-        columns.append(Column("row_hash", Text, nullable=False))
-
-        table = Table(
-            hash_state_table_name,
-            metadata,
-            *columns,
-            PrimaryKeyConstraint(*key_fields, name=f"pk_{hash_state_table_name}"[:63]),
-            schema=target_schema,
-        )
-        metadata.create_all(target_engine, tables=[table], checkfirst=True)
-
-    hash_state_table = reflect_table(target_engine, target_schema, hash_state_table_name)
-    missing_columns = set(key_fields) | {"row_hash"}
-    actual_columns = set(hash_state_table.columns.keys())
-    if not missing_columns.issubset(actual_columns):
-        raise ValueError(
-            f"Hash state table is missing required columns: {sorted(missing_columns - actual_columns)}"
-        )
-
-    return hash_state_table
-
 
 def _make_key_staging_table_name(target_table_name: str) -> str:
     suffix = uuid.uuid4().hex[:10]
@@ -406,90 +195,6 @@ def _use_precomputed_row_hashes(
         row_dict["row_hash"] = str(row_hash)
         result.append(row_dict)
     return result
-
-
-def _read_existing_hashes_for_keys(
-    target_engine,
-    hash_state_table: Table,
-    key_fields: Sequence[str],
-    key_tuples: Sequence[tuple[Any, ...]],
-) -> dict[tuple[Any, ...], str]:
-    if not key_tuples:
-        return {}
-
-    unique_keys = list(dict.fromkeys(key_tuples))
-
-    with target_engine.connect() as conn:
-        if len(key_fields) == 1:
-            key_field = key_fields[0]
-            key_values = [key[0] for key in unique_keys]
-            query = select(hash_state_table.c[key_field], hash_state_table.c.row_hash).where(
-                hash_state_table.c[key_field].in_(key_values)
-            )
-        else:
-            key_columns = [hash_state_table.c[field] for field in key_fields]
-            query = select(*key_columns, hash_state_table.c.row_hash).where(
-                tuple_(*key_columns).in_(unique_keys)
-            )
-
-        rows = conn.execute(query).mappings().all()
-
-    return {build_row_key(row, key_fields): row["row_hash"] for row in rows}
-
-
-def _chunk_rows(rows: Sequence[Mapping[str, Any]], chunk_size: int) -> Iterable[list[Mapping[str, Any]]]:
-    for index in range(0, len(rows), chunk_size):
-        yield list(rows[index : index + chunk_size])
-
-
-def _upsert_changed_rows(
-    target_engine,
-    target_table: Table,
-    hash_state_table: Table,
-    rows: Sequence[Mapping[str, Any]],
-    key_fields: Sequence[str],
-    fields: Sequence[str],
-    upsert_batch_size: int,
-) -> None:
-    if not rows:
-        return
-
-    target_update_fields = [field for field in fields if field not in key_fields]
-
-    with target_engine.begin() as conn:
-        # Keep statement deterministic for testing/debugging
-        sorted_rows = sorted(rows, key=lambda row: build_row_key(row, key_fields))
-        for rows_chunk in _chunk_rows(sorted_rows, upsert_batch_size):
-            target_rows_chunk = [
-                {field: row[field] for field in fields}
-                for row in rows_chunk
-            ]
-            target_insert_stmt = pg_insert(target_table).values(target_rows_chunk)
-            if target_update_fields:
-                target_upsert_stmt = target_insert_stmt.on_conflict_do_update(
-                    index_elements=list(key_fields),
-                    set_={field: target_insert_stmt.excluded[field] for field in target_update_fields},
-                )
-            else:
-                target_upsert_stmt = target_insert_stmt.on_conflict_do_nothing(
-                    index_elements=list(key_fields),
-                )
-            conn.execute(target_upsert_stmt)
-
-            hash_rows_chunk = [
-                {
-                    **{field: row[field] for field in key_fields},
-                    "row_hash": row["row_hash"],
-                }
-                for row in rows_chunk
-            ]
-            hash_insert_stmt = pg_insert(hash_state_table).values(hash_rows_chunk)
-            hash_upsert_stmt = hash_insert_stmt.on_conflict_do_update(
-                index_elements=list(key_fields),
-                set_={"row_hash": hash_insert_stmt.excluded.row_hash},
-            )
-            conn.execute(hash_upsert_stmt)
-
 
 def _delete_missing_rows(
     target_engine,
