@@ -95,6 +95,19 @@ class ObjectStoreClient:
             raise ValueError(f"Object store JSON payload must be an object for key: {normalized_key}")
         return payload
 
+    def object_exists(self, key: str) -> bool:
+        from botocore.exceptions import ClientError
+
+        normalized_key = self.config.normalize_key(key)
+        try:
+            self._client.head_object(Bucket=self.config.bucket, Key=normalized_key)
+        except ClientError as exc:
+            error_code = str(exc.response.get("Error", {}).get("Code", ""))
+            if error_code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
+        return True
+
     def copy_object(self, source_key: str, destination_key: str) -> str:
         normalized_source_key = self.config.normalize_key(source_key)
         normalized_destination_key = self.config.normalize_key(destination_key)
