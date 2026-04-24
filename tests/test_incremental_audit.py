@@ -12,8 +12,8 @@ from ingestion_core.adapters.object_store import ObjectStoreConfig
 from ingestion_core.contracts import ContractValidationError
 from ingestion_core.contracts.types import ContractDefinition
 import ingestion_core.strategies.incremental_audit.admin as incremental_admin_module
-import ingestion_core.strategies.incremental_audit.apply as incremental_apply_module
 import ingestion_core.strategies.incremental_audit.extract as incremental_extract_module
+import ingestion_core.strategies.common.delta_apply as delta_apply_module
 from ingestion_core.strategies.incremental_audit import (
     AuditWatermark,
     SourceAuditEvent,
@@ -372,19 +372,19 @@ def test_apply_delta_to_curated_loads_short_lived_staging_table_and_collapses_la
     }
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(incremental_apply_module, "create_sqlalchemy_engine", lambda _: engine)
-    monkeypatch.setattr(incremental_apply_module, "ensure_schema", lambda *args, **kwargs: None)
+    monkeypatch.setattr(delta_apply_module, "create_sqlalchemy_engine", lambda _: engine)
+    monkeypatch.setattr(delta_apply_module, "ensure_schema", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        incremental_apply_module,
+        delta_apply_module,
         "parse_table_name",
         lambda table_name: ("main", table_name.split(".", 1)[-1]),
     )
-    monkeypatch.setattr(incremental_apply_module, "ObjectStoreClient", FakeReaderObjectStoreClient)
-    monkeypatch.setattr(incremental_apply_module, "ensure_target_table_from_contract", lambda **kwargs: object())
-    monkeypatch.setattr(incremental_apply_module, "ensure_hash_state_table", lambda **kwargs: object())
-    monkeypatch.setattr(incremental_apply_module, "read_existing_hashes_for_keys", lambda **kwargs: {(1,): "hash-old", (3,): "hash-3"})
+    monkeypatch.setattr(delta_apply_module, "ObjectStoreClient", FakeReaderObjectStoreClient)
+    monkeypatch.setattr(delta_apply_module, "ensure_target_table_from_contract", lambda **kwargs: object())
+    monkeypatch.setattr(delta_apply_module, "ensure_hash_state_table", lambda **kwargs: object())
+    monkeypatch.setattr(delta_apply_module, "read_existing_hashes_for_keys", lambda **kwargs: {(1,): "hash-old", (3,): "hash-3"})
     monkeypatch.setattr(
-        incremental_apply_module,
+        delta_apply_module,
         "upsert_changed_rows",
         lambda **kwargs: captured.setdefault("upsert_rows", list(kwargs["rows"])),
     )
@@ -393,7 +393,7 @@ def test_apply_delta_to_curated_loads_short_lived_staging_table_and_collapses_la
         captured["delete_keys"] = list(kwargs["key_tuples"])
         return len(kwargs["key_tuples"])
 
-    monkeypatch.setattr(incremental_apply_module, "delete_rows_by_keys", _capture_delete_rows)
+    monkeypatch.setattr(delta_apply_module, "delete_rows_by_keys", _capture_delete_rows)
 
     result = apply_delta_to_curated(
         target_dsn="sqlite://",
