@@ -9,7 +9,6 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from ingestion_core.adapters.object_store import ObjectStoreConfig
-from ingestion_core.contracts import ContractValidationError
 from ingestion_core.contracts.types import ContractDefinition
 import ingestion_core.strategies.incremental_audit.admin as incremental_admin_module
 import ingestion_core.strategies.incremental_audit.extract as incremental_extract_module
@@ -261,7 +260,7 @@ def test_extract_validate_land_delta_splits_key_change_update_into_delete_and_up
     assert FakeUploadObjectStoreClient.json_payloads["delta/manifest.json"]["window_end"]["event_id"] == 20
 
 
-def test_extract_validate_land_delta_does_not_publish_delta_on_validation_failure(
+def test_extract_validate_land_delta_quarantines_invalid_events_and_still_publishes_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     contract = _build_contract()
@@ -293,6 +292,17 @@ def test_extract_validate_land_delta_does_not_publish_delta_on_validation_failur
                             row_before=None,
                             row_after={"id": None, "status": "BROKEN"},
                             changed_columns=[],
+                        ),
+                        SourceAuditEvent(
+                            event_id=31,
+                            op="I",
+                            source_txid=12,
+                            recorded_at=event_ts,
+                            ordering_ts=event_ts,
+                            key_json={"id": 10},
+                            row_before=None,
+                            row_after={"id": 10, "status": "VALID"},
+                            changed_columns=[],
                         )
                     ],
                     0.05,
@@ -302,21 +312,92 @@ def test_extract_validate_land_delta_does_not_publish_delta_on_validation_failur
     )
     monkeypatch.setattr(incremental_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
 
-    with pytest.raises(ContractValidationError, match="invalid audit events"):
-        extract_validate_land_delta(
-            source_dsn="postgresql://source",
-            source_audit_table="ingestion_meta.orders_audit",
-            contract=contract,
-            object_store_config=ObjectStoreConfig(bucket="landing"),
-            delta_object_key="delta/orders.ndjson.gz",
-            error_object_key="delta/errors.ndjson.gz",
-            manifest_key="delta/manifest.json",
-            extract_batch_size=1000,
-        )
+    result = extract_validate_land_delta(
+        source_dsn="postgresql://source",
+        source_audit_table="ingestion_meta.orders_audit",
+        contract=contract,
+        object_store_config=ObjectStoreConfig(bucket="landing"),
+        delta_object_key="delta/orders.ndjson.gz",
+        error_object_key="delta/errors.ndjson.gz",
+        manifest_key="delta/manifest.json",
+        extract_batch_size=1000,
+    )
 
-    assert "delta/orders.ndjson.gz" not in FakeUploadObjectStoreClient.uploads
+    assert result.delta_object_key == "delta/orders.ndjson.gz"
+    assert result.source_event_count == 2
+    assert result.normalized_event_count == 1
+    assert result.invalid_event_count == 1
+    assert result.upsert_event_count == 1
+    assert result.delete_event_count == 0
+
+    delta_rows = _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["delta/orders.ndjson.gz"])
+    assert len(delta_rows) == 1
+    assert delta_rows[0]["key"] == {"id": 10}
+    assert delta_rows[0]["row"]["status"] == "VALID"
     assert "delta/errors.ndjson.gz" in FakeUploadObjectStoreClient.uploads
-    assert FakeUploadObjectStoreClient.json_payloads["delta/manifest.json"]["delta_object_key"] is None
+    assert FakeUploadObjectStoreClient.json_payloads["delta/manifest.json"]["delta_object_key"] == "delta/orders.ndjson.gz"
+    assert FakeUploadObjectStoreClient.json_payloads["delta/manifest.json"]["invalid_event_count"] == 1
+
+
+def test_extract_validate_land_delta_publishes_empty_delta_when_all_events_are_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _build_contract()
+    FakeUploadObjectStoreClient.reset()
+    event_ts = datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(incremental_extract_module, "create_sqlalchemy_engine", lambda _: DummyEngine())
+    monkeypatch.setattr(incremental_extract_module, "parse_table_name", lambda _: ("ingestion_meta", "orders_audit"))
+    monkeypatch.setattr(incremental_extract_module, "resolve_watermark_mode", lambda *args, **kwargs: "recorded_at")
+    monkeypatch.setattr(
+        incremental_extract_module,
+        "_select_latest_watermark",
+        lambda **kwargs: AuditWatermark(ordering_ts=event_ts, event_id=40, mode="recorded_at"),
+    )
+    monkeypatch.setattr(
+        incremental_extract_module,
+        "_iter_source_audit_event_batches",
+        lambda **kwargs: iter(
+            [
+                (
+                    [
+                        SourceAuditEvent(
+                            event_id=40,
+                            op="I",
+                            source_txid=21,
+                            recorded_at=event_ts,
+                            ordering_ts=event_ts,
+                            key_json={"id": None},
+                            row_before=None,
+                            row_after={"id": None, "status": "BROKEN"},
+                            changed_columns=[],
+                        )
+                    ],
+                    0.05,
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(incremental_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
+
+    result = extract_validate_land_delta(
+        source_dsn="postgresql://source",
+        source_audit_table="ingestion_meta.orders_audit",
+        contract=contract,
+        object_store_config=ObjectStoreConfig(bucket="landing"),
+        delta_object_key="delta/orders.ndjson.gz",
+        error_object_key="delta/errors.ndjson.gz",
+        manifest_key="delta/manifest.json",
+        extract_batch_size=1000,
+    )
+
+    assert result.delta_object_key == "delta/orders.ndjson.gz"
+    assert result.source_event_count == 1
+    assert result.normalized_event_count == 0
+    assert result.invalid_event_count == 1
+
+    delta_rows = _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["delta/orders.ndjson.gz"])
+    assert delta_rows == []
 
 
 def test_apply_delta_to_curated_loads_short_lived_staging_table_and_collapses_latest_events(

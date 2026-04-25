@@ -14,7 +14,6 @@ from sqlalchemy import text
 from ingestion_core.adapters.object_store import ObjectStoreClient, ObjectStoreConfig
 from ingestion_core.adapters.postgres import create_sqlalchemy_engine, parse_table_name
 from ingestion_core.contracts.runtime import (
-    ContractValidationError,
     build_contract_key_payload,
     build_contract_row_payload,
     normalize_contract_key_row,
@@ -380,14 +379,12 @@ def extract_validate_land_delta(
             content_type="application/x-ndjson",
             content_encoding="gzip",
         )
-        uploaded_delta_key: str | None = None
-        if invalid_event_count == 0:
-            uploaded_delta_key = object_store.upload_file(
-                delta_temp_path,
-                delta_object_key,
-                content_type="application/x-ndjson",
-                content_encoding="gzip",
-            )
+        uploaded_delta_key = object_store.upload_file(
+            delta_temp_path,
+            delta_object_key,
+            content_type="application/x-ndjson",
+            content_encoding="gzip",
+        )
 
         manifest_object_key = _write_manifest(
             object_store,
@@ -415,11 +412,13 @@ def extract_validate_land_delta(
 
         if invalid_event_count > 0:
             error_summary = summarize_validation_errors(preview_errors)
-            raise ContractValidationError(
-                "Validation failed for contract "
-                f"{contract.contract_id}: {invalid_event_count} invalid audit events. "
-                f"Error report: {uploaded_error_key}. "
-                f"Examples: {error_summary}"
+            logger.warning(
+                "Extract-validate-land-delta completed with quarantined invalid audit events "
+                "for contract_id=%s invalid_event_count=%s error_object_key=%s examples=%s",
+                contract.contract_id,
+                invalid_event_count,
+                uploaded_error_key,
+                error_summary,
             )
 
         return ExtractValidateDeltaResult(
