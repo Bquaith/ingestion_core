@@ -14,6 +14,22 @@ def checkpoint_lsn_from_payload(checkpoint_payload: Mapping[str, Any] | None) ->
     return LogicalCdcCheckpoint.from_mapping(checkpoint_payload)
 
 
+def resolve_checkpoint_lsn(
+    start_lsn: str | None,
+    delta_result: Mapping[str, Any] | None,
+    apply_result: Mapping[str, Any] | None,
+) -> str | None:
+    if apply_result:
+        last_applied_lsn = str(apply_result.get("last_applied_lsn") or "").strip() or None
+        if last_applied_lsn:
+            return last_applied_lsn
+    if delta_result:
+        last_decoded_lsn = str(delta_result.get("last_decoded_lsn") or "").strip() or None
+        if last_decoded_lsn:
+            return last_decoded_lsn
+    return start_lsn
+
+
 def ack_logical_replication_slot(
     source_replication_dsn: str,
     source_slot_name: str,
@@ -55,4 +71,5 @@ __all__ = [
     "checkpoint_lsn_from_payload",
     "ensure_source_logical_cdc_capture",
     "extract_validate_land_wal_delta",
+    "resolve_checkpoint_lsn",
 ]

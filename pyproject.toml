@@ -29,6 +29,9 @@ dev = [
   "build>=1.2,<2"
 ]
 
+[project.scripts]
+ingestion-peek-logical-cdc = "ingestion_core.cli.peek_logical_cdc:main"
+
 [tool.setuptools]
 [tool.setuptools.packages.find]
 include = ["ingestion_core*"]

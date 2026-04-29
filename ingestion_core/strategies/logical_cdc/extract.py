@@ -15,7 +15,6 @@ from sqlalchemy import text
 from ingestion_core.adapters.object_store import ObjectStoreClient, ObjectStoreConfig
 from ingestion_core.adapters.postgres import create_sqlalchemy_engine
 from ingestion_core.contracts.runtime import (
-    ContractValidationError,
     build_contract_key_payload,
     build_contract_row_payload,
     normalize_contract_key_row,
@@ -42,6 +41,10 @@ _VALIDATION_ERROR_PREVIEW_LIMIT = 5
 
 class _StopReplication(Exception):
     pass
+
+
+def _transaction_identity(source_event: LogicalCdcSourceEvent) -> tuple[str, int | None]:
+    return source_event.commit_lsn, source_event.xid
 
 
 def _write_manifest(
@@ -75,6 +78,13 @@ def _event_errors(
         payload["event_role"] = event_role
         normalized.append(payload)
     return normalized
+
+
+def _extend_preview_errors(preview_errors: list[dict[str, Any]], errors: list[dict[str, Any]]) -> None:
+    if len(preview_errors) >= _VALIDATION_ERROR_PREVIEW_LIMIT:
+        return
+    remaining_slots = _VALIDATION_ERROR_PREVIEW_LIMIT - len(preview_errors)
+    preview_errors.extend(dict(error) for error in errors[:remaining_slots])
 
 
 def _normalize_delete_event(
@@ -238,6 +248,58 @@ def _normalize_source_event(
     ]
 
 
+def _flush_transaction(
+    transaction_entries: list[tuple[list[LogicalCdcDeltaEvent], list[dict[str, Any]]]],
+    transaction_event_count: int,
+    *,
+    delta_writer,
+    error_writer,
+    preview_errors: list[dict[str, Any]],
+) -> dict[str, int]:
+    has_errors = any(event_errors for _, event_errors in transaction_entries)
+    if has_errors:
+        invalid_event_count = 0
+        for _, event_errors in transaction_entries:
+            if not event_errors:
+                continue
+            invalid_event_count += 1
+            _extend_preview_errors(preview_errors, event_errors)
+            for error in event_errors:
+                error_writer.write(json.dumps(error, ensure_ascii=True))
+                error_writer.write("\n")
+        return {
+            "normalized_event_count": 0,
+            "upsert_event_count": 0,
+            "delete_event_count": 0,
+            "invalid_event_count": invalid_event_count,
+            "invalid_transaction_count": 1,
+            "quarantined_event_count": transaction_event_count,
+            "quarantined_transaction_count": 1,
+        }
+
+    normalized_event_count = 0
+    upsert_event_count = 0
+    delete_event_count = 0
+    for normalized_events, _ in transaction_entries:
+        for normalized_event in normalized_events:
+            delta_writer.write(json.dumps(normalized_event.to_payload(), ensure_ascii=True))
+            delta_writer.write("\n")
+            normalized_event_count += 1
+            if normalized_event.op == CDC_OP_UPSERT:
+                upsert_event_count += 1
+            else:
+                delete_event_count += 1
+    return {
+        "normalized_event_count": normalized_event_count,
+        "upsert_event_count": upsert_event_count,
+        "delete_event_count": delete_event_count,
+        "invalid_event_count": 0,
+        "invalid_transaction_count": 0,
+        "quarantined_event_count": 0,
+        "quarantined_transaction_count": 0,
+    }
+
+
 def _read_pgoutput_events(
     source_replication_dsn: str,
     source_slot_name: str,
@@ -351,6 +413,9 @@ def extract_validate_land_wal_delta(
     upsert_event_count = 0
     delete_event_count = 0
     invalid_event_count = 0
+    invalid_transaction_count = 0
+    quarantined_event_count = 0
+    quarantined_transaction_count = 0
     event_row_number = 0
     preview_errors: list[dict[str, Any]] = []
 
@@ -371,33 +436,66 @@ def extract_validate_land_wal_delta(
             idle_timeout_seconds=idle_timeout_seconds,
         )
         source_event_count = len(source_events)
+        if processed_messages == 0 and last_decoded_lsn is None:
+            logger.warning(
+                "Logical CDC extract read no replication messages for source_table=%s slot=%s "
+                "within window_start_lsn=%s window_end_lsn=%s",
+                source_table,
+                source_slot_name,
+                start_lsn,
+                window_end_lsn,
+            )
 
         with gzip.open(delta_temp_path, mode="wt", encoding="utf-8") as delta_writer, gzip.open(
             error_temp_path,
             mode="wt",
             encoding="utf-8",
         ) as error_writer:
+            current_transaction_identity: tuple[str, int | None] | None = None
+            current_transaction_entries: list[tuple[list[LogicalCdcDeltaEvent], list[dict[str, Any]]]] = []
+            current_transaction_event_count = 0
+
             for source_event in source_events:
+                transaction_identity = _transaction_identity(source_event)
+                if current_transaction_identity is not None and transaction_identity != current_transaction_identity:
+                    transaction_counts = _flush_transaction(
+                        current_transaction_entries,
+                        current_transaction_event_count,
+                        delta_writer=delta_writer,
+                        error_writer=error_writer,
+                        preview_errors=preview_errors,
+                    )
+                    normalized_event_count += transaction_counts["normalized_event_count"]
+                    upsert_event_count += transaction_counts["upsert_event_count"]
+                    delete_event_count += transaction_counts["delete_event_count"]
+                    invalid_event_count += transaction_counts["invalid_event_count"]
+                    invalid_transaction_count += transaction_counts["invalid_transaction_count"]
+                    quarantined_event_count += transaction_counts["quarantined_event_count"]
+                    quarantined_transaction_count += transaction_counts["quarantined_transaction_count"]
+                    current_transaction_entries = []
+                    current_transaction_event_count = 0
+
+                current_transaction_identity = transaction_identity
                 event_row_number += 1
                 normalized_events, event_errors = _normalize_source_event(source_event, contract, event_row_number)
-                if event_errors:
-                    invalid_event_count += 1
-                    if len(preview_errors) < _VALIDATION_ERROR_PREVIEW_LIMIT:
-                        remaining_slots = _VALIDATION_ERROR_PREVIEW_LIMIT - len(preview_errors)
-                        preview_errors.extend(dict(error) for error in event_errors[:remaining_slots])
-                    for error in event_errors:
-                        error_writer.write(json.dumps(error, ensure_ascii=True))
-                        error_writer.write("\n")
-                    continue
+                current_transaction_entries.append((normalized_events, event_errors))
+                current_transaction_event_count += 1
 
-                for normalized_event in normalized_events:
-                    delta_writer.write(json.dumps(normalized_event.to_payload(), ensure_ascii=True))
-                    delta_writer.write("\n")
-                    normalized_event_count += 1
-                    if normalized_event.op == CDC_OP_UPSERT:
-                        upsert_event_count += 1
-                    else:
-                        delete_event_count += 1
+            if current_transaction_entries:
+                transaction_counts = _flush_transaction(
+                    current_transaction_entries,
+                    current_transaction_event_count,
+                    delta_writer=delta_writer,
+                    error_writer=error_writer,
+                    preview_errors=preview_errors,
+                )
+                normalized_event_count += transaction_counts["normalized_event_count"]
+                upsert_event_count += transaction_counts["upsert_event_count"]
+                delete_event_count += transaction_counts["delete_event_count"]
+                invalid_event_count += transaction_counts["invalid_event_count"]
+                invalid_transaction_count += transaction_counts["invalid_transaction_count"]
+                quarantined_event_count += transaction_counts["quarantined_event_count"]
+                quarantined_transaction_count += transaction_counts["quarantined_transaction_count"]
 
         uploaded_error_key = object_store.upload_file(
             error_temp_path,
@@ -405,14 +503,12 @@ def extract_validate_land_wal_delta(
             content_type="application/x-ndjson",
             content_encoding="gzip",
         )
-        uploaded_delta_key: str | None = None
-        if invalid_event_count == 0:
-            uploaded_delta_key = object_store.upload_file(
-                delta_temp_path,
-                delta_object_key,
-                content_type="application/x-ndjson",
-                content_encoding="gzip",
-            )
+        uploaded_delta_key = object_store.upload_file(
+            delta_temp_path,
+            delta_object_key,
+            content_type="application/x-ndjson",
+            content_encoding="gzip",
+        )
 
         manifest_object_key = _write_manifest(
             object_store,
@@ -433,6 +529,9 @@ def extract_validate_land_wal_delta(
                 "upsert_event_count": upsert_event_count,
                 "delete_event_count": delete_event_count,
                 "invalid_event_count": invalid_event_count,
+                "invalid_transaction_count": invalid_transaction_count,
+                "quarantined_event_count": quarantined_event_count,
+                "quarantined_transaction_count": quarantined_transaction_count,
                 "processed_messages": processed_messages,
                 "source_read_seconds": source_read_seconds,
                 "delta_object_key": uploaded_delta_key,
@@ -445,11 +544,16 @@ def extract_validate_land_wal_delta(
 
         if invalid_event_count > 0:
             error_summary = summarize_validation_errors(preview_errors)
-            raise ContractValidationError(
-                "Validation failed for contract "
-                f"{contract.contract_id}: {invalid_event_count} invalid WAL events. "
-                f"Error report: {uploaded_error_key}. "
-                f"Examples: {error_summary}"
+            logger.warning(
+                "Extract-validate-land-wal-delta completed with quarantined invalid WAL transactions "
+                "for contract_id=%s invalid_event_count=%s invalid_transaction_count=%s "
+                "quarantined_event_count=%s error_object_key=%s examples=%s",
+                contract.contract_id,
+                invalid_event_count,
+                invalid_transaction_count,
+                quarantined_event_count,
+                uploaded_error_key,
+                error_summary,
             )
 
         return ExtractValidateLogicalCdcResult(
@@ -461,6 +565,9 @@ def extract_validate_land_wal_delta(
             upsert_event_count=upsert_event_count,
             delete_event_count=delete_event_count,
             invalid_event_count=invalid_event_count,
+            invalid_transaction_count=invalid_transaction_count,
+            quarantined_event_count=quarantined_event_count,
+            quarantined_transaction_count=quarantined_transaction_count,
             processed_messages=processed_messages,
             source_read_seconds=source_read_seconds,
             window_start_lsn=start_lsn,

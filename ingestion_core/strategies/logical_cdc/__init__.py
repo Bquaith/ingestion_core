@@ -2,7 +2,11 @@ from ingestion_core.strategies.logical_cdc.admin import ensure_source_logical_cd
 from ingestion_core.strategies.logical_cdc.apply import apply_wal_delta_to_curated
 from ingestion_core.strategies.logical_cdc.decode import PgOutputDecodeError, PgOutputDecoder
 from ingestion_core.strategies.logical_cdc.extract import extract_validate_land_wal_delta
-from ingestion_core.strategies.logical_cdc.pipeline import ack_logical_replication_slot, checkpoint_lsn_from_payload
+from ingestion_core.strategies.logical_cdc.pipeline import (
+    ack_logical_replication_slot,
+    checkpoint_lsn_from_payload,
+    resolve_checkpoint_lsn,
+)
 from ingestion_core.strategies.logical_cdc.types import (
     OUTPUT_PLUGIN_PGOUTPUT,
     REPLICA_IDENTITY_DEFAULT,
@@ -38,4 +42,5 @@ __all__ = [
     "int_to_lsn",
     "lsn_to_int",
     "max_lsn",
+    "resolve_checkpoint_lsn",
 ]

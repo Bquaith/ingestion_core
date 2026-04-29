@@ -20,6 +20,7 @@ from ingestion_core.strategies.logical_cdc import (
     int_to_lsn,
     lsn_to_int,
     max_lsn,
+    resolve_checkpoint_lsn,
 )
 from ingestion_core.strategies.logical_cdc.types import (
     LogicalCdcSourceEvent,
@@ -308,6 +309,40 @@ def test_lsn_helpers_round_trip_and_compare() -> None:
     assert max_lsn(None, "0/16B6C80", "0/16B6CC0") == "0/16B6CC0"
 
 
+def test_resolve_checkpoint_lsn_does_not_advance_to_window_end_without_replication_progress() -> None:
+    assert (
+        resolve_checkpoint_lsn(
+            start_lsn="0/16B6C80",
+            delta_result={
+                "processed_messages": 0,
+                "last_decoded_lsn": None,
+                "window_end_lsn": "0/16B6D00",
+            },
+            apply_result={"last_applied_lsn": None},
+        )
+        == "0/16B6C80"
+    )
+
+
+def test_resolve_checkpoint_lsn_prefers_applied_then_decoded_lsn() -> None:
+    assert (
+        resolve_checkpoint_lsn(
+            start_lsn="0/16B6C80",
+            delta_result={"last_decoded_lsn": "0/16B6CC0", "window_end_lsn": "0/16B6D00"},
+            apply_result={"last_applied_lsn": "0/16B6CE0"},
+        )
+        == "0/16B6CE0"
+    )
+    assert (
+        resolve_checkpoint_lsn(
+            start_lsn="0/16B6C80",
+            delta_result={"last_decoded_lsn": "0/16B6CC0", "window_end_lsn": "0/16B6D00"},
+            apply_result={"last_applied_lsn": None},
+        )
+        == "0/16B6CC0"
+    )
+
+
 def test_pgoutput_decoder_emits_insert_update_delete_after_commit() -> None:
     decoder = PgOutputDecoder(source_table="public.orders")
 
@@ -471,6 +506,182 @@ def test_extract_validate_land_wal_delta_accepts_update_without_old_key(
     assert delta_rows[0]["op"] == "UPSERT"
     assert delta_rows[0]["key"] == {"id": 1}
     assert delta_rows[0]["row"]["status"] == "PAID"
+
+
+def test_extract_validate_land_wal_delta_quarantines_entire_invalid_transaction_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _build_contract()
+    FakeUploadObjectStoreClient.reset()
+    relation = PgOutputRelation(
+        relation_id=10,
+        schema="public",
+        table="orders",
+        replica_identity="d",
+        columns=[
+            PgOutputRelationColumn(name="id", type_oid=23, atttypmod=-1, flags=1),
+            PgOutputRelationColumn(name="status", type_oid=25, atttypmod=-1, flags=0),
+        ],
+    )
+    source_events = [
+        LogicalCdcSourceEvent(
+            source_op="I",
+            commit_lsn="0/16B6C80",
+            end_lsn="0/16B6CC0",
+            change_index=0,
+            xid=101,
+            commit_ts=datetime(2026, 4, 24, 10, 0, 0, tzinfo=timezone.utc),
+            relation=relation,
+            old_key=None,
+            row_after={"id": "1", "status": "NEW"},
+        ),
+        LogicalCdcSourceEvent(
+            source_op="I",
+            commit_lsn="0/16B6C80",
+            end_lsn="0/16B6CC0",
+            change_index=1,
+            xid=101,
+            commit_ts=datetime(2026, 4, 24, 10, 0, 0, tzinfo=timezone.utc),
+            relation=relation,
+            old_key=None,
+            row_after={"status": "BROKEN"},
+        ),
+        LogicalCdcSourceEvent(
+            source_op="I",
+            commit_lsn="0/16B6D80",
+            end_lsn="0/16B6DC0",
+            change_index=0,
+            xid=102,
+            commit_ts=datetime(2026, 4, 24, 10, 1, 0, tzinfo=timezone.utc),
+            relation=relation,
+            old_key=None,
+            row_after={"id": "2", "status": "PAID"},
+        ),
+    ]
+
+    monkeypatch.setattr(logical_extract_module, "_select_current_wal_lsn", lambda _: "0/16B6E00")
+    monkeypatch.setattr(
+        logical_extract_module,
+        "_read_pgoutput_events",
+        lambda **kwargs: (source_events, 2, 0.05, "0/16B6DC0"),
+    )
+    monkeypatch.setattr(logical_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
+
+    result = logical_extract_module.extract_validate_land_wal_delta(
+        source_dsn="postgresql://source",
+        source_replication_dsn="postgresql://source",
+        source_table="public.orders",
+        source_slot_name="slot_ingestion_sales_orders",
+        source_publication_name="pub_ingestion_sales_orders",
+        contract=contract,
+        object_store_config=ObjectStoreConfig(bucket="landing"),
+        delta_object_key="wal_delta/orders.ndjson.gz",
+        error_object_key="wal_delta/errors.ndjson.gz",
+        manifest_key="wal_delta/manifest.json",
+        start_lsn="0/16B6C00",
+        max_extract_seconds=1,
+    )
+
+    assert result.delta_object_key == "wal_delta/orders.ndjson.gz"
+    assert result.source_event_count == 3
+    assert result.normalized_event_count == 1
+    assert result.upsert_event_count == 1
+    assert result.delete_event_count == 0
+    assert result.invalid_event_count == 1
+    assert result.invalid_transaction_count == 1
+    assert result.quarantined_event_count == 2
+    assert result.quarantined_transaction_count == 1
+    assert result.last_decoded_lsn == "0/16B6DC0"
+
+    delta_rows = _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["wal_delta/orders.ndjson.gz"])
+    assert len(delta_rows) == 1
+    assert delta_rows[0]["commit_lsn"] == "0/16B6D80"
+    assert delta_rows[0]["end_lsn"] == "0/16B6DC0"
+    assert delta_rows[0]["change_index"] == 0
+    assert delta_rows[0]["op"] == "UPSERT"
+    assert delta_rows[0]["key"] == {"id": 2}
+    assert delta_rows[0]["row"] == {"id": 2, "status": "PAID"}
+    assert isinstance(delta_rows[0]["row_hash"], str)
+    assert delta_rows[0]["xid"] == 102
+    assert delta_rows[0]["commit_ts"] == "2026-04-24T10:01:00+00:00"
+
+    error_rows = _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["wal_delta/errors.ndjson.gz"])
+    assert len(error_rows) == 1
+    assert error_rows[0]["field"] == "id"
+    assert error_rows[0]["code"] == "missing_field"
+
+    manifest = FakeUploadObjectStoreClient.json_payloads["wal_delta/manifest.json"]
+    assert manifest["delta_object_key"] == "wal_delta/orders.ndjson.gz"
+    assert manifest["invalid_transaction_count"] == 1
+    assert manifest["quarantined_event_count"] == 2
+    assert manifest["quarantined_transaction_count"] == 1
+
+
+def test_extract_validate_land_wal_delta_uploads_empty_delta_when_all_transactions_are_quarantined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _build_contract()
+    FakeUploadObjectStoreClient.reset()
+    relation = PgOutputRelation(
+        relation_id=10,
+        schema="public",
+        table="orders",
+        replica_identity="d",
+        columns=[
+            PgOutputRelationColumn(name="id", type_oid=23, atttypmod=-1, flags=1),
+            PgOutputRelationColumn(name="status", type_oid=25, atttypmod=-1, flags=0),
+        ],
+    )
+    source_event = LogicalCdcSourceEvent(
+        source_op="I",
+        commit_lsn="0/16B6C80",
+        end_lsn="0/16B6CC0",
+        change_index=0,
+        xid=201,
+        commit_ts=datetime(2026, 4, 24, 11, 0, 0, tzinfo=timezone.utc),
+        relation=relation,
+        old_key=None,
+        row_after={"status": "BROKEN"},
+    )
+
+    monkeypatch.setattr(logical_extract_module, "_select_current_wal_lsn", lambda _: "0/16B6D00")
+    monkeypatch.setattr(
+        logical_extract_module,
+        "_read_pgoutput_events",
+        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0"),
+    )
+    monkeypatch.setattr(logical_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
+
+    result = logical_extract_module.extract_validate_land_wal_delta(
+        source_dsn="postgresql://source",
+        source_replication_dsn="postgresql://source",
+        source_table="public.orders",
+        source_slot_name="slot_ingestion_sales_orders",
+        source_publication_name="pub_ingestion_sales_orders",
+        contract=contract,
+        object_store_config=ObjectStoreConfig(bucket="landing"),
+        delta_object_key="wal_delta/orders.ndjson.gz",
+        error_object_key="wal_delta/errors.ndjson.gz",
+        manifest_key="wal_delta/manifest.json",
+        start_lsn="0/16B6C00",
+        max_extract_seconds=1,
+    )
+
+    assert result.delta_object_key == "wal_delta/orders.ndjson.gz"
+    assert result.source_event_count == 1
+    assert result.normalized_event_count == 0
+    assert result.invalid_event_count == 1
+    assert result.invalid_transaction_count == 1
+    assert result.quarantined_event_count == 1
+    assert result.quarantined_transaction_count == 1
+
+    assert _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["wal_delta/orders.ndjson.gz"]) == []
+    error_rows = _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["wal_delta/errors.ndjson.gz"])
+    assert len(error_rows) == 1
+    assert error_rows[0]["field"] == "id"
+    assert FakeUploadObjectStoreClient.json_payloads["wal_delta/manifest.json"]["delta_object_key"] == (
+        "wal_delta/orders.ndjson.gz"
+    )
 
 
 def test_extract_validate_land_wal_delta_rejects_invalid_idle_timeout() -> None:

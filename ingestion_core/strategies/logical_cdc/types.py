@@ -188,6 +188,9 @@ class ExtractValidateLogicalCdcResult:
     upsert_event_count: int
     delete_event_count: int
     invalid_event_count: int
+    invalid_transaction_count: int
+    quarantined_event_count: int
+    quarantined_transaction_count: int
     processed_messages: int
     source_read_seconds: float
     window_start_lsn: str | None
@@ -205,6 +208,9 @@ class ExtractValidateLogicalCdcResult:
             "upsert_event_count": self.upsert_event_count,
             "delete_event_count": self.delete_event_count,
             "invalid_event_count": self.invalid_event_count,
+            "invalid_transaction_count": self.invalid_transaction_count,
+            "quarantined_event_count": self.quarantined_event_count,
+            "quarantined_transaction_count": self.quarantined_transaction_count,
             "processed_messages": self.processed_messages,
             "source_read_seconds": self.source_read_seconds,
             "window_start_lsn": self.window_start_lsn,
