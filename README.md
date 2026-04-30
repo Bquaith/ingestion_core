@@ -144,6 +144,23 @@ source PostgreSQL
 
 Snapshot `hash_diff` при этом остаётся пригодным для bootstrap и reconciliation.
 
+### Отдельный CLI для настройки источника под audit trigger
+
+Если подготовку источника нужно выполнить заранее, без запуска Airflow DAG, используй:
+
+```bash
+ingestion-ensure-incremental-audit \
+  --source-admin-dsn 'postgresql+psycopg2://postgres:postgres@localhost:5432/source_db' \
+  --source-table public.orders \
+  --source-audit-table ingestion_meta.orders_audit \
+  --contract-file ./orders.contract.json \
+  --pretty
+```
+
+CLI использует ключевые поля контракта для генерации `key_json` в audit trigger,
+поэтому для него нужен либо `--contract-file`, либо доступ к contract registry через
+`--contracts-service-url --namespace --name [--contract-version]`.
+
 ## Logical CDC Strategy
 
 Для PostgreSQL source-систем, где можно включить logical replication:
@@ -175,6 +192,23 @@ source PostgreSQL WAL
 - поддержан только нативный `pgoutput`
 - `TRUNCATE` события не применяются автоматически
 - для корректной обработки DELETE и UPDATE со сменой ключа источник должен отдавать старый ключ через replica identity
+
+### Отдельный CLI для настройки источника под logical CDC
+
+Если publication/slot/WAL-проверку нужно выполнить отдельно от DAG, используй:
+
+```bash
+ingestion-ensure-logical-cdc \
+  --source-admin-dsn 'postgresql+psycopg2://postgres:postgres@localhost:5432/source_db' \
+  --source-table public.orders \
+  --source-publication-name orders_pub \
+  --source-slot-name orders_slot \
+  --replica-identity-mode full \
+  --pretty
+```
+
+Для этого CLI `source_replication_dsn` не нужен: он требуется только на стадии extract WAL,
+а не на стадии source setup.
 
 ## Тесты
 

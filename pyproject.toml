@@ -31,6 +31,12 @@ dev = [
 
 [project.scripts]
 ingestion-peek-logical-cdc = "ingestion_core.cli.peek_logical_cdc:main"
+ingestion-ensure-incremental-audit = "ingestion_core.cli.incremental_audit_admin:main"
+ingestion-ensure-logical-cdc = "ingestion_core.cli.logical_cdc_admin:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.setuptools]
 [tool.setuptools.packages.find]
