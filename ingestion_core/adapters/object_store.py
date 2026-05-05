@@ -108,6 +108,11 @@ class ObjectStoreClient:
             raise
         return True
 
+    def get_object_size(self, key: str) -> int:
+        normalized_key = self.config.normalize_key(key)
+        response = self._client.head_object(Bucket=self.config.bucket, Key=normalized_key)
+        return int(response.get("ContentLength") or 0)
+
     def copy_object(self, source_key: str, destination_key: str) -> str:
         normalized_source_key = self.config.normalize_key(source_key)
         normalized_destination_key = self.config.normalize_key(destination_key)

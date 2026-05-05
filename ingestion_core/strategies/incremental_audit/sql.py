@@ -28,9 +28,16 @@ def make_audit_trigger_name(source_table_name: str) -> str:
     return validate_identifier(f"_ia_trg_{source_table_name}_{suffix}"[:63])
 
 
+def _xid_from_txid_expression(column_name: str) -> str:
+    # txid_current() returns a 64-bit epoch-qualified transaction ID, while
+    # pg_xact_commit_timestamp(...) accepts xid (32-bit). Strip the epoch bits
+    # and cast through text because PostgreSQL does not allow bigint -> xid.
+    return f"((({column_name} % 4294967296)::text)::xid)"
+
+
 def ordering_expression(watermark_mode: str) -> str:
     if watermark_mode == WATERMARK_MODE_COMMIT_TIMESTAMP:
-        return "COALESCE(pg_xact_commit_timestamp(source_txid), recorded_at)"
+        return f"COALESCE(pg_xact_commit_timestamp({_xid_from_txid_expression('source_txid')}), recorded_at)"
     if watermark_mode == WATERMARK_MODE_RECORDED_AT:
         return "recorded_at"
     raise ValueError(f"Unsupported watermark_mode: {watermark_mode}")
