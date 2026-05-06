@@ -31,6 +31,7 @@ from ingestion_core.strategies.logical_cdc.types import (
     ExtractValidateLogicalCdcResult,
     LogicalCdcDeltaEvent,
     LogicalCdcSourceEvent,
+    int_to_lsn,
     lsn_to_int,
 )
 
@@ -309,7 +310,7 @@ def _read_pgoutput_events(
     window_end_lsn: str,
     max_extract_seconds: int,
     idle_timeout_seconds: int | None = None,
-) -> tuple[list[LogicalCdcSourceEvent], int, float, str | None]:
+) -> tuple[list[LogicalCdcSourceEvent], int, float, str | None, str | None, bool]:
     import psycopg2
     from psycopg2.extras import LogicalReplicationConnection
 
@@ -317,22 +318,55 @@ def _read_pgoutput_events(
     events: list[LogicalCdcSourceEvent] = []
     processed_messages = 0
     last_decoded_lsn: str | None = None
+    last_stream_wal_end_lsn: str | None = None
+    reached_window_end = False
     window_end_int = lsn_to_int(window_end_lsn)
     started_at = perf_counter()
-    last_message_at = started_at
+    last_stream_progress_at: float | None = None
 
     conn = psycopg2.connect(source_replication_dsn, connection_factory=LogicalReplicationConnection)
     try:
         cur = conn.cursor()
 
+        def _refresh_stream_progress(message=None) -> None:
+            nonlocal last_stream_wal_end_lsn, reached_window_end, last_stream_progress_at
+
+            wal_end_candidates: list[int] = []
+            cursor_wal_end = getattr(cur, "wal_end", None)
+            if isinstance(cursor_wal_end, int) and cursor_wal_end > 0:
+                wal_end_candidates.append(cursor_wal_end)
+
+            message_wal_end = getattr(message, "wal_end", None)
+            if isinstance(message_wal_end, int) and message_wal_end > 0:
+                wal_end_candidates.append(message_wal_end)
+
+            if not wal_end_candidates:
+                return
+
+            wal_end_int = max(wal_end_candidates)
+            previous_wal_end_int = lsn_to_int(last_stream_wal_end_lsn) if last_stream_wal_end_lsn else None
+            if previous_wal_end_int is None or wal_end_int > previous_wal_end_int:
+                last_stream_wal_end_lsn = int_to_lsn(wal_end_int)
+                last_stream_progress_at = perf_counter()
+            elif message is not None:
+                last_stream_progress_at = perf_counter()
+
+            if wal_end_int >= window_end_int:
+                reached_window_end = True
+
         def _consume(message) -> None:
-            nonlocal processed_messages, last_decoded_lsn, last_message_at
-            processed_messages += 1
-            last_message_at = perf_counter()
+            nonlocal processed_messages, last_decoded_lsn
+            _refresh_stream_progress(message)
             if perf_counter() - started_at > max_extract_seconds:
                 raise _StopReplication()
 
             payload = bytes(message.payload)
+            if not payload:
+                if reached_window_end:
+                    raise _StopReplication()
+                return
+
+            processed_messages += 1
             decoded_events = decoder.decode_message(payload)
             for event in decoded_events:
                 if lsn_to_int(event.commit_lsn) > window_end_int:
@@ -354,15 +388,22 @@ def _read_pgoutput_events(
         try:
             while perf_counter() - started_at <= max_extract_seconds:
                 message = cur.read_message()
+                _refresh_stream_progress()
+                if reached_window_end and message is None:
+                    break
                 if message is None:
-                    if idle_timeout_seconds is not None and perf_counter() - last_message_at >= idle_timeout_seconds:
+                    if (
+                        idle_timeout_seconds is not None
+                        and last_stream_progress_at is not None
+                        and perf_counter() - last_stream_progress_at >= idle_timeout_seconds
+                    ):
                         break
                     remaining = max_extract_seconds - (perf_counter() - started_at)
                     if remaining <= 0:
                         break
                     wait_seconds = min(1.0, remaining)
-                    if idle_timeout_seconds is not None:
-                        idle_remaining = idle_timeout_seconds - (perf_counter() - last_message_at)
+                    if idle_timeout_seconds is not None and last_stream_progress_at is not None:
+                        idle_remaining = idle_timeout_seconds - (perf_counter() - last_stream_progress_at)
                         if idle_remaining <= 0:
                             break
                         wait_seconds = min(wait_seconds, idle_remaining)
@@ -377,7 +418,14 @@ def _read_pgoutput_events(
     finally:
         conn.close()
 
-    return events, processed_messages, perf_counter() - started_at, last_decoded_lsn
+    return (
+        events,
+        processed_messages,
+        perf_counter() - started_at,
+        last_decoded_lsn,
+        last_stream_wal_end_lsn,
+        reached_window_end,
+    )
 
 
 def extract_validate_land_wal_delta(
@@ -425,7 +473,14 @@ def extract_validate_land_wal_delta(
         error_temp_path = error_temp_file.name
 
     try:
-        source_events, processed_messages, source_read_seconds, last_decoded_lsn = _read_pgoutput_events(
+        (
+            source_events,
+            processed_messages,
+            source_read_seconds,
+            last_decoded_lsn,
+            last_stream_wal_end_lsn,
+            reached_window_end,
+        ) = _read_pgoutput_events(
             source_replication_dsn=source_replication_dsn,
             source_slot_name=source_slot_name,
             source_publication_name=source_publication_name,
@@ -438,12 +493,15 @@ def extract_validate_land_wal_delta(
         source_event_count = len(source_events)
         if processed_messages == 0 and last_decoded_lsn is None:
             logger.warning(
-                "Logical CDC extract read no replication messages for source_table=%s slot=%s "
-                "within window_start_lsn=%s window_end_lsn=%s",
+                "Logical CDC extract read no pgoutput messages for source_table=%s slot=%s "
+                "within window_start_lsn=%s window_end_lsn=%s reached_window_end=%s "
+                "last_stream_wal_end_lsn=%s",
                 source_table,
                 source_slot_name,
                 start_lsn,
                 window_end_lsn,
+                reached_window_end,
+                last_stream_wal_end_lsn,
             )
 
         with gzip.open(delta_temp_path, mode="wt", encoding="utf-8") as delta_writer, gzip.open(
@@ -522,6 +580,8 @@ def extract_validate_land_wal_delta(
                 "window_start_lsn": start_lsn,
                 "window_end_lsn": window_end_lsn,
                 "last_decoded_lsn": last_decoded_lsn,
+                "last_stream_wal_end_lsn": last_stream_wal_end_lsn,
+                "reached_window_end": reached_window_end,
                 "contract_id": contract.contract_id,
                 "contract_version": contract.version,
                 "source_event_count": source_event_count,
@@ -573,6 +633,8 @@ def extract_validate_land_wal_delta(
             window_start_lsn=start_lsn,
             window_end_lsn=window_end_lsn,
             last_decoded_lsn=last_decoded_lsn,
+            last_stream_wal_end_lsn=last_stream_wal_end_lsn,
+            reached_window_end=reached_window_end,
             output_plugin=output_plugin,
         )
     finally:

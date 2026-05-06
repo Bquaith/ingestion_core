@@ -317,10 +317,27 @@ def test_resolve_checkpoint_lsn_does_not_advance_to_window_end_without_replicati
                 "processed_messages": 0,
                 "last_decoded_lsn": None,
                 "window_end_lsn": "0/16B6D00",
+                "reached_window_end": False,
             },
             apply_result={"last_applied_lsn": None},
         )
         == "0/16B6C80"
+    )
+
+
+def test_resolve_checkpoint_lsn_advances_to_window_end_after_stream_catches_up() -> None:
+    assert (
+        resolve_checkpoint_lsn(
+            start_lsn="0/16B6C80",
+            delta_result={
+                "processed_messages": 0,
+                "last_decoded_lsn": None,
+                "window_end_lsn": "0/16B6D00",
+                "reached_window_end": True,
+            },
+            apply_result={"last_applied_lsn": None},
+        )
+        == "0/16B6D00"
     )
 
 
@@ -341,6 +358,79 @@ def test_resolve_checkpoint_lsn_prefers_applied_then_decoded_lsn() -> None:
         )
         == "0/16B6CC0"
     )
+
+
+class _FakeReplicationCursor:
+    def __init__(self, wal_end_steps: list[int], messages: list[object | None]) -> None:
+        self._wal_end_steps = list(wal_end_steps)
+        self._messages = list(messages)
+        self.wal_end = 0
+
+    def start_replication(self, **kwargs) -> None:
+        self.start_replication_kwargs = kwargs
+
+    def read_message(self):
+        if self._wal_end_steps:
+            self.wal_end = self._wal_end_steps.pop(0)
+        if self._messages:
+            return self._messages.pop(0)
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeReplicationConnection:
+    def __init__(self, cursor: _FakeReplicationCursor) -> None:
+        self._cursor = cursor
+
+    def cursor(self) -> _FakeReplicationCursor:
+        return self._cursor
+
+    def fileno(self) -> int:
+        return 0
+
+    def close(self) -> None:
+        return None
+
+
+def test_read_pgoutput_events_marks_empty_window_as_caught_up_from_replication_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import psycopg2
+
+    wal_end = lsn_to_int("0/16B6D00")
+    fake_cursor = _FakeReplicationCursor(
+        wal_end_steps=[wal_end],
+        messages=[None],
+    )
+    fake_connection = _FakeReplicationConnection(fake_cursor)
+
+    monkeypatch.setattr(psycopg2, "connect", lambda *args, **kwargs: fake_connection)
+
+    (
+        source_events,
+        processed_messages,
+        _source_read_seconds,
+        last_decoded_lsn,
+        last_stream_wal_end_lsn,
+        reached_window_end,
+    ) = logical_extract_module._read_pgoutput_events(
+        source_replication_dsn="postgresql://source",
+        source_slot_name="slot_ingestion_sales_orders",
+        source_publication_name="pub_ingestion_sales_orders",
+        source_table="public.orders",
+        window_start_lsn="0/16B6C80",
+        window_end_lsn="0/16B6D00",
+        max_extract_seconds=1,
+        idle_timeout_seconds=1,
+    )
+
+    assert source_events == []
+    assert processed_messages == 0
+    assert last_decoded_lsn is None
+    assert last_stream_wal_end_lsn == "0/16B6D00"
+    assert reached_window_end is True
 
 
 def test_pgoutput_decoder_emits_insert_update_delete_after_commit() -> None:
@@ -411,7 +501,7 @@ def test_extract_validate_land_wal_delta_splits_key_change_update_into_delete_an
     monkeypatch.setattr(
         logical_extract_module,
         "_read_pgoutput_events",
-        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0"),
+        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0", "0/16B6D00", True),
     )
     monkeypatch.setattr(logical_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
 
@@ -436,6 +526,8 @@ def test_extract_validate_land_wal_delta_splits_key_change_update_into_delete_an
     assert result.upsert_event_count == 1
     assert result.delete_event_count == 1
     assert result.last_decoded_lsn == "0/16B6CC0"
+    assert result.last_stream_wal_end_lsn == "0/16B6D00"
+    assert result.reached_window_end is True
 
     delta_rows = _read_gzip_ndjson(FakeUploadObjectStoreClient.uploads["wal_delta/orders.ndjson.gz"])
     assert [row["op"] for row in delta_rows] == ["DELETE", "UPSERT"]
@@ -478,7 +570,7 @@ def test_extract_validate_land_wal_delta_accepts_update_without_old_key(
     monkeypatch.setattr(
         logical_extract_module,
         "_read_pgoutput_events",
-        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0"),
+        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0", "0/16B6D00", True),
     )
     monkeypatch.setattr(logical_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
 
@@ -563,7 +655,7 @@ def test_extract_validate_land_wal_delta_quarantines_entire_invalid_transaction_
     monkeypatch.setattr(
         logical_extract_module,
         "_read_pgoutput_events",
-        lambda **kwargs: (source_events, 2, 0.05, "0/16B6DC0"),
+        lambda **kwargs: (source_events, 2, 0.05, "0/16B6DC0", "0/16B6E00", True),
     )
     monkeypatch.setattr(logical_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
 
@@ -648,7 +740,7 @@ def test_extract_validate_land_wal_delta_uploads_empty_delta_when_all_transactio
     monkeypatch.setattr(
         logical_extract_module,
         "_read_pgoutput_events",
-        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0"),
+        lambda **kwargs: ([source_event], 1, 0.05, "0/16B6CC0", "0/16B6D00", True),
     )
     monkeypatch.setattr(logical_extract_module, "ObjectStoreClient", FakeUploadObjectStoreClient)
 

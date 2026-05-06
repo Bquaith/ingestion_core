@@ -196,6 +196,8 @@ class ExtractValidateLogicalCdcResult:
     window_start_lsn: str | None
     window_end_lsn: str | None
     last_decoded_lsn: str | None
+    last_stream_wal_end_lsn: str | None
+    reached_window_end: bool
     output_plugin: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -216,6 +218,8 @@ class ExtractValidateLogicalCdcResult:
             "window_start_lsn": self.window_start_lsn,
             "window_end_lsn": self.window_end_lsn,
             "last_decoded_lsn": self.last_decoded_lsn,
+            "last_stream_wal_end_lsn": self.last_stream_wal_end_lsn,
+            "reached_window_end": self.reached_window_end,
             "output_plugin": self.output_plugin,
         }
 

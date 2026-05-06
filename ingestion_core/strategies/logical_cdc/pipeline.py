@@ -27,6 +27,10 @@ def resolve_checkpoint_lsn(
         last_decoded_lsn = str(delta_result.get("last_decoded_lsn") or "").strip() or None
         if last_decoded_lsn:
             return last_decoded_lsn
+        reached_window_end = bool(delta_result.get("reached_window_end"))
+        window_end_lsn = str(delta_result.get("window_end_lsn") or "").strip() or None
+        if reached_window_end and window_end_lsn:
+            return window_end_lsn
     return start_lsn
 
 
