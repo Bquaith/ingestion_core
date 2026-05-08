@@ -256,7 +256,11 @@ def extract_validate_land_snapshot(
                 "Validation failed for contract "
                 f"{contract.contract_id}: {invalid_row_count} invalid rows. "
                 f"Error report: {uploaded_error_key}. "
-                f"Examples: {error_summary}"
+                f"Examples: {error_summary}",
+                error_object_key=uploaded_error_key,
+                manifest_key=manifest_object_key,
+                accepted_object_key=uploaded_accepted_key,
+                invalid_row_count=invalid_row_count,
             )
 
         logger.info(

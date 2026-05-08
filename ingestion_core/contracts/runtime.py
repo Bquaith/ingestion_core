@@ -17,6 +17,21 @@ from ingestion_core.utils.hashing import calculate_row_hash
 class ContractValidationError(RuntimeError):
     """Raised when extracted rows do not satisfy the active contract."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_object_key: str | None = None,
+        manifest_key: str | None = None,
+        accepted_object_key: str | None = None,
+        invalid_row_count: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_object_key = error_object_key
+        self.manifest_key = manifest_key
+        self.accepted_object_key = accepted_object_key
+        self.invalid_row_count = invalid_row_count
+
 
 @dataclass(frozen=True)
 class ContractRowValidationResult:
